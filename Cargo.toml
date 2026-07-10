@@ -54,9 +54,6 @@ rand = "0.8"
 # Open URLs in browser
 open = "5"
 
-# Native file dialogs
-rfd = "0.15"
-
 # URL encoding
 urlencoding = "2.1.3"
 

@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 use crossterm::{
     event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -57,6 +57,9 @@ struct App {
 
     /// Track the last render area for the switch list so we can scroll
     list_scroll_offset: usize,
+
+    /// Last successful quota refresh time
+    last_quota_refresh: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl App {
@@ -71,6 +74,7 @@ impl App {
             active_account_id: state.active_account_id,
             mode: state.mode.clone(),
             list_scroll_offset: 0,
+            last_quota_refresh: None,
         }
     }
 
@@ -150,13 +154,15 @@ async fn run_loop(
     state: &mut AppState,
     app: &mut App,
 ) -> Result<(), AgySwitchError> {
-    let mut last_refresh = std::time::Instant::now();
-    let refresh_interval = std::time::Duration::from_secs(3);
+    let mut last_disk_reload = std::time::Instant::now();
+    let disk_reload_interval = std::time::Duration::from_secs(3);
+    let mut last_api_refresh = std::time::Instant::now();
+    let api_refresh_interval = std::time::Duration::from_secs(20);
 
     loop {
         render(term, store, state, app)?;
 
-        // Poll for key events with a 1-second timeout so we can periodic refresh
+        // Poll for key events with a 1-second timeout so we can do periodic work
         let key = loop {
             if crossterm::event::poll(std::time::Duration::from_secs(1)).map_err(io_err)? {
                 if let Event::Key(k) = crossterm::event::read().map_err(io_err)? {
@@ -167,9 +173,28 @@ async fn run_loop(
             }
 
             // Periodic store reload from disk (daemon may have written new quota data)
-            if last_refresh.elapsed() >= refresh_interval {
-                last_refresh = std::time::Instant::now();
+            if last_disk_reload.elapsed() >= disk_reload_interval {
+                last_disk_reload = std::time::Instant::now();
                 let _ = store.load().await;
+            }
+
+            // Periodic API quota refresh (every 20s) — the TUI fetches its own quotas
+            if last_api_refresh.elapsed() >= api_refresh_interval {
+                last_api_refresh = std::time::Instant::now();
+                match crate::store::active_writer::fetch_all_quotas(store).await {
+                    Ok(n) if n > 0 => {
+                        let _ = store.flush().await;
+                        app.last_quota_refresh = Some(chrono::Utc::now());
+                    }
+                    Ok(_) => {
+                        // No accounts to refresh, still update timestamp
+                        app.last_quota_refresh = Some(chrono::Utc::now());
+                    }
+                    Err(_) => {
+                        // Network error — keep last known data, don't clear quotas
+                        // The store still has the previous quota values
+                    }
+                }
                 render(term, store, state, app)?;
             }
         };
@@ -948,11 +973,24 @@ fn draw_status_bar(
     };
 
     let mem_kb = store.memory_usage() / 1024;
+    let refresh_str = app.last_quota_refresh
+        .map(|t| {
+            let elapsed = (chrono::Utc::now() - t).num_seconds();
+            if elapsed < 60 {
+                format!("{}s ago", elapsed)
+            } else if elapsed < 3600 {
+                format!("{}m ago", elapsed / 60)
+            } else {
+                format!("{}h ago", elapsed / 3600)
+            }
+        })
+        .unwrap_or_else(|| "never".to_string());
     let status_info = format!(
-        " {} accounts | {} | {}KB ",
+        " {} accounts | {} | {}KB | refreshed {} ",
         store.count(),
         if state.enabled { "Daemon ON" } else { "Daemon OFF" },
         mem_kb,
+        refresh_str,
     );
 
     let line = if !app.msg.is_empty() {
@@ -1185,124 +1223,143 @@ async fn handle_accounts_menu(
         KeyCode::Down | KeyCode::Char('j') => menu_down(&mut app.menu_idx, ACCOUNTS_MENU.len()),
         KeyCode::Enter => match app.menu_idx {
             0 => {
-                // Import from JSON
+                // Import from JSON — use file path input instead of native dialog for SSH compatibility
                 exit_tui();
-                match open_json_file_dialog() {
-                    Some(path) => {
-                        let _ = re_enter_tui();
-                        eprintln!(
-                            "[AGY-SWITCH] Importing accounts from: {}",
-                            path.display()
-                        );
+                eprintln!("[AGY-SWITCH] Enter path to JSON file to import (or press Enter to cancel):");
+                eprint!("> ");
+                io::stdout().flush().unwrap_or(());
+                let mut path_str = String::new();
+                io::stdin().read_line(&mut path_str).unwrap_or(0);
+                let path_str = path_str.trim().to_string();
 
-                        let result = tokio::task::spawn_blocking(move || {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(|e| {
-                                    AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
-                                })?;
-                            rt.block_on(async {
-                                let mut s =
-                                    FileStore::new(crate::config::accounts_path());
-                                s.load().await?;
-                                let r =
-                                    crate::commands::account_add::handle_add_json(&mut s, path)
-                                        .await?;
-                                Ok::<crate::commands::account_add::ImportResult, AgySwitchError>(r)
-                            })
-                        })
-                        .await;
+                if path_str.is_empty() {
+                    let _ = re_enter_tui();
+                    app.set_msg("Import cancelled", Color::DarkGray);
+                    app.screen = Screen::MainMenu;
+                    app.menu_idx = 1;
+                    return Ok(());
+                }
 
-                        match result {
-                            Ok(Ok(r)) => {
-                                if r.errors.is_empty() {
-                                    app.set_msg(
-                                        format!("Import: {}", r.summary()),
-                                        Color::Green,
-                                    );
-                                } else {
-                                    app.set_msg(
-                                        format!(
-                                            "Import: {} | Errors: {}",
-                                            r.summary(),
-                                            r.errors[0]
-                                        ),
-                                        Color::Yellow,
-                                    );
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                app.set_msg(format!("Import failed: {}", e), Color::Red);
-                            }
-                            Err(e) => {
-                                app.set_msg(format!("Error: {}", e), Color::Red);
-                            }
+                let path = std::path::PathBuf::from(&path_str);
+                if !path.exists() {
+                    let _ = re_enter_tui();
+                    app.set_msg(format!("File not found: {}", path_str), Color::Red);
+                    app.screen = Screen::MainMenu;
+                    app.menu_idx = 1;
+                    return Ok(());
+                }
+
+                eprintln!("[AGY-SWITCH] Importing accounts from: {}", path.display());
+
+                let result = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| {
+                            AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
+                        })?;
+                    rt.block_on(async {
+                        let mut s = FileStore::new(crate::config::accounts_path());
+                        s.load().await?;
+                        let r = crate::commands::account_add::handle_add_json(&mut s, path).await?;
+                        Ok::<crate::commands::account_add::ImportResult, AgySwitchError>(r)
+                    })
+                })
+                .await;
+
+                // Always reload store and re-enter TUI, regardless of result
+                store.load().await.unwrap_or(());
+                let _ = re_enter_tui();
+
+                match result {
+                    Ok(Ok(r)) => {
+                        if r.errors.is_empty() {
+                            app.set_msg(format!("Import: {}", r.summary()), Color::Green);
+                        } else {
+                            app.set_msg(
+                                format!("Import: {} | Errors: {}", r.summary(), r.errors[0]),
+                                Color::Yellow,
+                            );
                         }
-
-                        // Reload store
-                        store.load().await.unwrap_or(());
                     }
-                    None => {
-                        let _ = re_enter_tui();
-                        app.set_msg("Import cancelled", Color::DarkGray);
+                    Ok(Err(e)) => {
+                        app.set_msg(format!("Import failed: {}", e), Color::Red);
+                    }
+                    Err(e) => {
+                        app.set_msg(format!("Error: {}", e), Color::Red);
                     }
                 }
+
                 app.screen = Screen::MainMenu;
                 app.menu_idx = 1;
             }
             1 => {
-                // Export to JSON
+                // Export to JSON — use text prompt for SSH compatibility
                 exit_tui();
-                match open_save_json_dialog() {
-                    Some(path) => {
-                        let _ = re_enter_tui();
-                        let accounts = store.list();
+                eprintln!("[AGY-SWITCH] Enter path to save JSON export (or press Enter to cancel):");
+                eprint!("> ");
+                io::stdout().flush().unwrap_or(());
+                let mut path_str = String::new();
+                io::stdin().read_line(&mut path_str).unwrap_or(0);
+                let path_str = path_str.trim().to_string();
 
-                        if accounts.is_empty() {
-                            app.set_msg("No accounts to export", Color::Yellow);
-                        } else {
-                            let export_data: Vec<serde_json::Value> = accounts
-                                .iter()
-                                .map(|a| {
-                                    let mut obj = serde_json::json!({
-                                        "email": a.email,
-                                        "access_token": a.credential.access_token,
-                                        "refresh_token": a.credential.refresh_token,
-                                        "expiry": a.credential.expiry.to_rfc3339(),
-                                    });
-                                    if let Some(l) = &a.label {
-                                        obj["label"] = serde_json::json!(l);
-                                    }
-                                    if let Some(p) = &a.credential.project_id {
-                                        obj["project_id"] = serde_json::json!(p);
-                                    }
-                                    obj
-                                })
-                                .collect();
-                            let export = serde_json::json!({
-                                "version": 1,
-                                "accounts": export_data,
-                            });
-                            let json =
-                                serde_json::to_string_pretty(&export)
-                                    .map_err(AgySwitchError::Json)?;
-                            std::fs::write(&path, &json).map_err(AgySwitchError::Io)?;
-                            app.set_msg(
-                                format!(
-                                    "Exported {} accounts to {}",
-                                    accounts.len(),
-                                    path.display()
-                                ),
-                                Color::Green,
-                            );
+                if path_str.is_empty() {
+                    let _ = re_enter_tui();
+                    app.set_msg("Export cancelled", Color::DarkGray);
+                    app.screen = Screen::MainMenu;
+                    app.menu_idx = 1;
+                    return Ok(());
+                }
+
+                let path = std::path::PathBuf::from(&path_str);
+                let accounts = store.list();
+
+                if accounts.is_empty() {
+                    let _ = re_enter_tui();
+                    app.set_msg("No accounts to export", Color::Yellow);
+                    app.screen = Screen::MainMenu;
+                    app.menu_idx = 1;
+                    return Ok(());
+                }
+
+                let export_data: Vec<serde_json::Value> = accounts
+                    .iter()
+                    .map(|a| {
+                        let mut obj = serde_json::json!({
+                            "email": a.email,
+                            "access_token": a.credential.access_token,
+                            "refresh_token": a.credential.refresh_token,
+                            "expiry": a.credential.expiry.to_rfc3339(),
+                        });
+                        if let Some(l) = &a.label {
+                            obj["label"] = serde_json::json!(l);
                         }
-                    }
-                    None => {
+                        if let Some(p) = &a.credential.project_id {
+                            obj["project_id"] = serde_json::json!(p);
+                        }
+                        obj
+                    })
+                    .collect();
+                let export = serde_json::json!({
+                    "version": 1,
+                    "accounts": export_data,
+                });
+                let json = serde_json::to_string_pretty(&export).map_err(AgySwitchError::Json)?;
+
+                match std::fs::write(&path, &json) {
+                    Ok(()) => {
                         let _ = re_enter_tui();
-                        app.set_msg("Export cancelled", Color::DarkGray);
+                        app.set_msg(
+                            format!("Exported {} accounts to {}", accounts.len(), path.display()),
+                            Color::Green,
+                        );
+                    }
+                    Err(e) => {
+                        let _ = re_enter_tui();
+                        app.set_msg(format!("Export failed: {}", e), Color::Red);
                     }
                 }
+
                 app.screen = Screen::MainMenu;
                 app.menu_idx = 1;
             }
@@ -1326,6 +1383,10 @@ async fn handle_accounts_menu(
                 })
                 .await;
 
+                // Always reload store and re-enter TUI
+                store.load().await.unwrap_or(());
+                let _ = re_enter_tui();
+
                 match result {
                     Ok(Ok(email)) => {
                         app.set_msg(format!("Added: {}", email), Color::Green);
@@ -1338,10 +1399,6 @@ async fn handle_accounts_menu(
                     }
                 }
 
-                // Reload store from disk
-                store.load().await.unwrap_or(());
-
-                let _ = re_enter_tui();
                 app.screen = Screen::MainMenu;
                 app.menu_idx = 1;
             }
@@ -1485,20 +1542,6 @@ fn re_enter_tui() -> Result<(), AgySwitchError> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(io_err)?;
     Ok(())
-}
-
-fn open_json_file_dialog() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("JSON Files", &["json"])
-        .set_title("Select accounts JSON file to import")
-        .pick_file()
-}
-
-fn open_save_json_dialog() -> Option<std::path::PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("JSON Files", &["json"])
-        .set_title("Save accounts as JSON")
-        .save_file()
 }
 
 // ══════════════════════════════════════════════════════════════
