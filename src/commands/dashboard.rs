@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io;
 use crossterm::{
     event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -19,20 +19,31 @@ use crate::store::file_store::FileStore;
 
 use uuid::Uuid;
 
-/// RAII guard that restores the terminal on drop (even on panic).
-struct TerminalGuard;
+struct TerminalGuard {
+    active: std::cell::Cell<bool>,
+}
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+impl TerminalGuard {
+    fn new() -> Self {
+        Self {
+            active: std::cell::Cell::new(true),
+        }
+    }
+
+    fn disarm(&self) {
+        self.active.set(false);
     }
 }
 
-// ══════════════════════════════════════════════════════════════
-//  SCREENS
-// ══════════════════════════════════════════════════════════════
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.active.get() {
+            let _ = disable_raw_mode();
+            let mut stdout = io::stdout();
+            let _ = execute!(stdout, LeaveAlternateScreen);
+        }
+    }
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
@@ -42,6 +53,12 @@ enum Screen {
     ContextMenu,
     ModeMenu,
     Help,
+    TextInput,
+}
+
+enum TextInputPurpose {
+    ImportJson,
+    ExportJson,
 }
 
 struct App {
@@ -55,11 +72,12 @@ struct App {
     active_account_id: Option<Uuid>,
     mode: SwitchMode,
 
-    /// Track the last render area for the switch list so we can scroll
     list_scroll_offset: usize,
 
-    /// Last successful quota refresh time
     last_quota_refresh: Option<chrono::DateTime<chrono::Utc>>,
+
+    text_input: String,
+    text_input_purpose: Option<TextInputPurpose>,
 }
 
 impl App {
@@ -75,6 +93,8 @@ impl App {
             mode: state.mode.clone(),
             list_scroll_offset: 0,
             last_quota_refresh: None,
+            text_input: String::new(),
+            text_input_purpose: None,
         }
     }
 
@@ -83,10 +103,6 @@ impl App {
         self.msg_color = color;
     }
 }
-
-// ══════════════════════════════════════════════════════════════
-//  MENU ITEMS
-// ══════════════════════════════════════════════════════════════
 
 const MAIN_MENU: &[&str] = &[
     "Switch Accounts",
@@ -113,19 +129,11 @@ const CTX_MENU: &[&str] = &[
     "Back",
 ];
 
-
-// ══════════════════════════════════════════════════════════════
-//  PUBLIC ENTRY
-// ══════════════════════════════════════════════════════════════
-
 pub async fn run_dashboard() -> Result<(), AgySwitchError> {
-    // Load store and state internally
     let mut store = FileStore::new(crate::config::accounts_path());
     store.load().await?;
     let mut state = load_state().await?;
 
-    // Quick sync: only import from official tools (fast, no API calls)
-    // Skip fetch_all_quotas at startup — let the daemon handle live quota updates
     let _ = crate::store::active_writer::import_from_official_tools(&mut store).await;
     let _ = crate::store::active_writer::import_from_proxy_readonly(&mut store).await;
 
@@ -135,24 +143,26 @@ pub async fn run_dashboard() -> Result<(), AgySwitchError> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(io_err)?;
 
-    let _guard = TerminalGuard;
+    let guard = TerminalGuard::new();
     let mut app = App::new(&store, &state);
-    run_loop(&mut terminal, &mut store, &mut state, &mut app).await
+    let result = run_loop(&mut terminal, &mut store, &mut state, &mut app, &guard).await;
+    guard.disarm();
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
+    result
 }
 
 fn io_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> AgySwitchError {
     AgySwitchError::Io(io::Error::new(io::ErrorKind::Other, e))
 }
 
-// ══════════════════════════════════════════════════════════════
-//  EVENT LOOP
-// ══════════════════════════════════════════════════════════════
-
 async fn run_loop(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     store: &mut FileStore,
     state: &mut AppState,
     app: &mut App,
+    guard: &TerminalGuard,
 ) -> Result<(), AgySwitchError> {
     let mut last_disk_reload = std::time::Instant::now();
     let disk_reload_interval = std::time::Duration::from_secs(3);
@@ -162,7 +172,6 @@ async fn run_loop(
     loop {
         render(term, store, state, app)?;
 
-        // Poll for key events with a 1-second timeout so we can do periodic work
         let key = loop {
             if crossterm::event::poll(std::time::Duration::from_secs(1)).map_err(io_err)? {
                 if let Event::Key(k) = crossterm::event::read().map_err(io_err)? {
@@ -172,13 +181,11 @@ async fn run_loop(
                 }
             }
 
-            // Periodic store reload from disk (daemon may have written new quota data)
             if last_disk_reload.elapsed() >= disk_reload_interval {
                 last_disk_reload = std::time::Instant::now();
                 let _ = store.load().await;
             }
 
-            // Periodic API quota refresh (every 20s) — the TUI fetches its own quotas
             if last_api_refresh.elapsed() >= api_refresh_interval {
                 last_api_refresh = std::time::Instant::now();
                 match crate::store::active_writer::fetch_all_quotas(store).await {
@@ -187,13 +194,9 @@ async fn run_loop(
                         app.last_quota_refresh = Some(chrono::Utc::now());
                     }
                     Ok(_) => {
-                        // No accounts to refresh, still update timestamp
                         app.last_quota_refresh = Some(chrono::Utc::now());
                     }
-                    Err(_) => {
-                        // Network error — keep last known data, don't clear quotas
-                        // The store still has the previous quota values
-                    }
+                    Err(_) => {}
                 }
                 render(term, store, state, app)?;
             }
@@ -211,7 +214,7 @@ async fn run_loop(
         match app.screen {
             Screen::MainMenu => handle_main_menu(key, app, store, state).await?,
             Screen::SwitchAccounts => handle_switch_accounts(key, app, store, state).await?,
-            Screen::AccountsMenu => handle_accounts_menu(key, app, store, state).await?,
+            Screen::AccountsMenu => handle_accounts_menu(key, app, store, state, guard).await?,
             Screen::ContextMenu => handle_context_menu(key, app, store, state).await?,
             Screen::ModeMenu => handle_mode_menu(key, app, state),
             Screen::Help => {
@@ -220,6 +223,7 @@ async fn run_loop(
                     app.menu_idx = 4;
                 }
             }
+            Screen::TextInput => handle_text_input(key, app, store, guard).await?,
         }
 
         if app.quit {
@@ -228,10 +232,6 @@ async fn run_loop(
     }
     Ok(())
 }
-
-// ══════════════════════════════════════════════════════════════
-//  RENDER
-// ══════════════════════════════════════════════════════════════
 
 fn render(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -244,9 +244,9 @@ fn render(
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),  // Header
-                Constraint::Min(8),    // Content
-                Constraint::Length(2), // Status bar
+                Constraint::Length(4),
+                Constraint::Min(8),
+                Constraint::Length(2),
             ])
             .split(area);
 
@@ -257,8 +257,6 @@ fn render(
     .map_err(io_err)?;
     Ok(())
 }
-
-// ── Header ──────────────────────────────────────────────────
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, store: &FileStore, state: &AppState) {
     let accounts = store.list();
@@ -289,7 +287,6 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, store: &FileStore, state: &Ap
         .map(|a| a.email.as_str())
         .unwrap_or("none");
 
-    // Line 1: Branding
     let line1 = Line::from(vec![
         Span::styled(
             " AGY-SWITCH ",
@@ -316,13 +313,9 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, store: &FileStore, state: &Ap
         ),
     ]);
 
-    // Line 2: Active account
     let line2 = Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            "Active: ",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             active_email.to_string(),
             Style::default()
@@ -331,7 +324,6 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, store: &FileStore, state: &Ap
         ),
     ]);
 
-    // Line 3: Account stats
     let line3 = Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -359,8 +351,6 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, store: &FileStore, state: &Ap
     f.render_widget(header, area);
 }
 
-// ── Content router ──────────────────────────────────────────
-
 fn draw_content(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -375,10 +365,55 @@ fn draw_content(
         Screen::ContextMenu => draw_menu(f, area, CTX_MENU, app.menu_idx, " Account Actions "),
         Screen::ModeMenu => draw_mode_menu(f, area, state, app),
         Screen::Help => draw_help(f, area),
+        Screen::TextInput => draw_text_input(f, area, app),
     }
 }
 
-// ── Generic menu renderer ───────────────────────────────────
+fn draw_text_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let title = match &app.text_input_purpose {
+        Some(TextInputPurpose::ImportJson) => " Import from JSON ",
+        Some(TextInputPurpose::ExportJson) => " Export to JSON ",
+        None => " Input ",
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter file path (or press Esc to cancel):",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}_", app.text_input),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press Enter to confirm",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
 
 fn draw_menu(f: &mut ratatui::Frame, area: Rect, items: &[&str], selected: usize, title: &str) {
     let list_items: Vec<ListItem> = items
@@ -435,8 +470,6 @@ fn draw_menu(f: &mut ratatui::Frame, area: Rect, items: &[&str], selected: usize
     );
 }
 
-// ── Switch Accounts screen ────────────────────────────────
-
 fn draw_switch_accounts(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -476,16 +509,13 @@ fn draw_switch_accounts(
         return;
     }
 
-    // Layout: left list (60%) + right detail (40%)
     let h = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    // ── Left: account list ──
-    let visible_height = (h[0].height as usize).saturating_sub(2); // subtract borders
+    let visible_height = (h[0].height as usize).saturating_sub(2);
 
-    // Calculate scroll offset to keep selected item visible
     let scroll_offset = if app.list_idx >= app.list_scroll_offset + visible_height {
         app.list_idx - visible_height + 1
     } else if app.list_idx < app.list_scroll_offset {
@@ -503,18 +533,16 @@ fn draw_switch_accounts(
             let is_active = state.active_account_id == Some(a.id);
             let is_sel = i == app.list_idx;
 
-            // Status icon
             let (status_icon, status_color) = if !a.enabled {
-                ("\u{2716}", Color::Red) // ✖
+                ("\u{2716}", Color::Red)
             } else if a.is_rate_limited {
-                ("\u{26A0}", Color::Yellow) // ⚠
+                ("\u{26A0}", Color::Yellow)
             } else if is_active {
-                ("\u{25CF}", Color::Green) // ●
+                ("\u{25CF}", Color::Green)
             } else {
-                ("\u{25CB}", Color::DarkGray) // ○
+                ("\u{25CB}", Color::DarkGray)
             };
 
-            // Quota string
             let quota_str = compute_quota_remaining_str(a);
 
             let (fg, bg) = if is_sel {
@@ -587,7 +615,6 @@ fn draw_switch_accounts(
         &mut ls,
     );
 
-    // ── Right: detail pane ──
     if let Some(a) = accounts.get(app.list_idx) {
         draw_detail_pane(f, h[1], a, state);
     } else {
@@ -686,7 +713,6 @@ fn draw_detail_pane(
 
     lines.push(Line::from(""));
 
-    // Quota section
     if let Some(quota) = &a.quota {
         lines.push(Line::from(Span::styled(
             "  Quota",
@@ -704,8 +730,6 @@ fn draw_detail_pane(
             for m in &quota.models {
                 let pct = m.remaining_fraction.map_or(100u64, |f| (f * 100.0).round() as u64);
 
-                // If account is rate limited, ALL bars show as rate-limited (red)
-                // regardless of the actual percentage — because the account can't use any model
                 let (bar, bar_color, status_suffix) = if a.is_rate_limited {
                     let s = " ▓▓▓▓▓▓▓▓▓▓".to_string();
                     (s, Color::Red, " RATE LIMITED")
@@ -736,7 +760,6 @@ fn draw_detail_pane(
             }
         }
     } else {
-        // No quota data at all
         let (status_text, status_color) = if a.is_rate_limited {
             ("  Rate limited (no quota data)", Color::Red)
         } else if !a.enabled {
@@ -767,8 +790,6 @@ fn draw_detail_pane(
         area,
     );
 }
-
-// ── Mode menu (with current indicator) ──────────────────────
 
 fn draw_mode_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState, app: &App) {
     let current = match state.mode {
@@ -843,8 +864,6 @@ fn draw_mode_menu(f: &mut ratatui::Frame, area: Rect, state: &AppState, app: &Ap
         &mut ls,
     );
 }
-
-// ── Help ────────────────────────────────────────────────────
 
 fn draw_help(f: &mut ratatui::Frame, area: Rect) {
     let text = vec![
@@ -948,8 +967,6 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
     );
 }
 
-// ── Status bar (bottom) ─────────────────────────────────────
-
 fn draw_status_bar(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -970,6 +987,7 @@ fn draw_status_bar(
         Screen::AccountsMenu => " \u{2191}\u{2193} Navigate   Enter Select   Esc Back ",
         Screen::ModeMenu => " \u{2191}\u{2193} Navigate   Enter Select   Esc Back ",
         Screen::Help => " Enter/Esc Back ",
+        Screen::TextInput => " Type path   Enter Confirm   Esc Cancel ",
     };
 
     let mem_kb = store.memory_usage() / 1024;
@@ -1019,10 +1037,6 @@ fn draw_status_bar(
     );
 }
 
-// ══════════════════════════════════════════════════════════════
-//  HANDLERS
-// ══════════════════════════════════════════════════════════════
-
 fn menu_up(idx: &mut usize, count: usize) {
     if count == 0 {
         return;
@@ -1044,8 +1058,6 @@ fn menu_down(idx: &mut usize, count: usize) {
         *idx = 0;
     }
 }
-
-// ── Main menu ───────────────────────────────────────────────
 
 async fn handle_main_menu(
     key: KeyEvent,
@@ -1089,8 +1101,6 @@ async fn handle_main_menu(
     Ok(())
 }
 
-// ── Switch Accounts ─────────────────────────────────────────
-
 async fn handle_switch_accounts(
     key: KeyEvent,
     app: &mut App,
@@ -1119,7 +1129,6 @@ async fn handle_switch_accounts(
         KeyCode::Enter => {
             if count > 0 && app.list_idx < count {
                 if app.mode == SwitchMode::Manual {
-                    // Manual mode: directly activate the selected account
                     if let Some(a) = store.list_sorted().get(app.list_idx).cloned() {
                         let account_clone = a.clone();
                         let result = tokio::task::spawn_blocking(move || {
@@ -1131,13 +1140,11 @@ async fn handle_switch_accounts(
 
                         match result {
                             Ok(fresh_cred) => {
-                                // Save the refreshed credential back to the store
                                 if let Some(stored) = store.list_mut().iter_mut().find(|s| s.id == a.id) {
                                     stored.credential = fresh_cred;
                                 }
                                 state.active_account_id = Some(a.id);
                                 app.active_account_id = Some(a.id);
-                                // Persist state immediately so switching survives crashes
                                 let _ = crate::config::save_state(state).await;
                                 app.set_msg(
                                     format!("Switched to: {}", a.email),
@@ -1153,13 +1160,11 @@ async fn handle_switch_accounts(
                         }
                     }
                 } else {
-                    // Auto mode: open context menu
                     app.screen = Screen::ContextMenu;
                     app.menu_idx = 0;
                 }
             }
         }
-        // x or Delete: remove the selected account (works in both modes)
         KeyCode::Char('x') | KeyCode::Delete => {
             if count > 0 && app.list_idx < count {
                 if let Some(a) = store.list_sorted().get(app.list_idx).cloned() {
@@ -1188,7 +1193,6 @@ async fn handle_switch_accounts(
                 }
             }
         }
-        // R: refresh quota for all accounts
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.set_msg("Refreshing quota...".to_string(), Color::Yellow);
             match crate::store::active_writer::fetch_all_quotas(store).await {
@@ -1206,13 +1210,12 @@ async fn handle_switch_accounts(
     Ok(())
 }
 
-// ── Add menu ────────────────────────────────────────────────
-
 async fn handle_accounts_menu(
     key: KeyEvent,
     app: &mut App,
     store: &mut FileStore,
     _state: &mut AppState,
+    guard: &TerminalGuard,
 ) -> Result<(), AgySwitchError> {
     match key.code {
         KeyCode::Esc => {
@@ -1223,149 +1226,21 @@ async fn handle_accounts_menu(
         KeyCode::Down | KeyCode::Char('j') => menu_down(&mut app.menu_idx, ACCOUNTS_MENU.len()),
         KeyCode::Enter => match app.menu_idx {
             0 => {
-                // Import from JSON — use file path input instead of native dialog for SSH compatibility
-                exit_tui();
-                eprintln!("[AGY-SWITCH] Enter path to JSON file to import (or press Enter to cancel):");
-                eprint!("> ");
-                io::stdout().flush().unwrap_or(());
-                let mut path_str = String::new();
-                io::stdin().read_line(&mut path_str).unwrap_or(0);
-                let path_str = path_str.trim().to_string();
-
-                if path_str.is_empty() {
-                    let _ = re_enter_tui();
-                    app.set_msg("Import cancelled", Color::DarkGray);
-                    app.screen = Screen::MainMenu;
-                    app.menu_idx = 1;
-                    return Ok(());
-                }
-
-                let path = std::path::PathBuf::from(&path_str);
-                if !path.exists() {
-                    let _ = re_enter_tui();
-                    app.set_msg(format!("File not found: {}", path_str), Color::Red);
-                    app.screen = Screen::MainMenu;
-                    app.menu_idx = 1;
-                    return Ok(());
-                }
-
-                eprintln!("[AGY-SWITCH] Importing accounts from: {}", path.display());
-
-                let result = tokio::task::spawn_blocking(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
-                        })?;
-                    rt.block_on(async {
-                        let mut s = FileStore::new(crate::config::accounts_path());
-                        s.load().await?;
-                        let r = crate::commands::account_add::handle_add_json(&mut s, path).await?;
-                        Ok::<crate::commands::account_add::ImportResult, AgySwitchError>(r)
-                    })
-                })
-                .await;
-
-                // Always reload store and re-enter TUI, regardless of result
-                store.load().await.unwrap_or(());
-                let _ = re_enter_tui();
-
-                match result {
-                    Ok(Ok(r)) => {
-                        if r.errors.is_empty() {
-                            app.set_msg(format!("Import: {}", r.summary()), Color::Green);
-                        } else {
-                            app.set_msg(
-                                format!("Import: {} | Errors: {}", r.summary(), r.errors[0]),
-                                Color::Yellow,
-                            );
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        app.set_msg(format!("Import failed: {}", e), Color::Red);
-                    }
-                    Err(e) => {
-                        app.set_msg(format!("Error: {}", e), Color::Red);
-                    }
-                }
-
-                app.screen = Screen::MainMenu;
-                app.menu_idx = 1;
+                app.text_input.clear();
+                app.text_input_purpose = Some(TextInputPurpose::ImportJson);
+                app.screen = Screen::TextInput;
             }
             1 => {
-                // Export to JSON — use text prompt for SSH compatibility
-                exit_tui();
-                eprintln!("[AGY-SWITCH] Enter path to save JSON export (or press Enter to cancel):");
-                eprint!("> ");
-                io::stdout().flush().unwrap_or(());
-                let mut path_str = String::new();
-                io::stdin().read_line(&mut path_str).unwrap_or(0);
-                let path_str = path_str.trim().to_string();
-
-                if path_str.is_empty() {
-                    let _ = re_enter_tui();
-                    app.set_msg("Export cancelled", Color::DarkGray);
-                    app.screen = Screen::MainMenu;
-                    app.menu_idx = 1;
-                    return Ok(());
-                }
-
-                let path = std::path::PathBuf::from(&path_str);
-                let accounts = store.list();
-
-                if accounts.is_empty() {
-                    let _ = re_enter_tui();
-                    app.set_msg("No accounts to export", Color::Yellow);
-                    app.screen = Screen::MainMenu;
-                    app.menu_idx = 1;
-                    return Ok(());
-                }
-
-                let export_data: Vec<serde_json::Value> = accounts
-                    .iter()
-                    .map(|a| {
-                        let mut obj = serde_json::json!({
-                            "email": a.email,
-                            "access_token": a.credential.access_token,
-                            "refresh_token": a.credential.refresh_token,
-                            "expiry": a.credential.expiry.to_rfc3339(),
-                        });
-                        if let Some(l) = &a.label {
-                            obj["label"] = serde_json::json!(l);
-                        }
-                        if let Some(p) = &a.credential.project_id {
-                            obj["project_id"] = serde_json::json!(p);
-                        }
-                        obj
-                    })
-                    .collect();
-                let export = serde_json::json!({
-                    "version": 1,
-                    "accounts": export_data,
-                });
-                let json = serde_json::to_string_pretty(&export).map_err(AgySwitchError::Json)?;
-
-                match std::fs::write(&path, &json) {
-                    Ok(()) => {
-                        let _ = re_enter_tui();
-                        app.set_msg(
-                            format!("Exported {} accounts to {}", accounts.len(), path.display()),
-                            Color::Green,
-                        );
-                    }
-                    Err(e) => {
-                        let _ = re_enter_tui();
-                        app.set_msg(format!("Export failed: {}", e), Color::Red);
-                    }
-                }
-
-                app.screen = Screen::MainMenu;
-                app.menu_idx = 1;
+                app.text_input.clear();
+                app.text_input_purpose = Some(TextInputPurpose::ExportJson);
+                app.screen = Screen::TextInput;
             }
             2 => {
-                // Login via OAuth
-                exit_tui();
+                guard.disarm();
+                let _ = disable_raw_mode();
+                let mut stdout = io::stdout();
+                let _ = execute!(stdout, LeaveAlternateScreen);
+
                 eprintln!("[AGY-SWITCH] Opening browser for OAuth login...");
                 eprintln!("[AGY-SWITCH] Complete the login in your browser.");
                 eprintln!("[AGY-SWITCH] Waiting for callback...");
@@ -1383,9 +1258,13 @@ async fn handle_accounts_menu(
                 })
                 .await;
 
-                // Always reload store and re-enter TUI
                 store.load().await.unwrap_or(());
-                let _ = re_enter_tui();
+
+                enable_raw_mode().map_err(io_err)?;
+                let mut stdout = io::stdout();
+                execute!(stdout, EnterAlternateScreen).map_err(io_err)?;
+
+                guard.active.set(true);
 
                 match result {
                     Ok(Ok(email)) => {
@@ -1409,7 +1288,149 @@ async fn handle_accounts_menu(
     Ok(())
 }
 
-// ── Context menu (Auto mode only) ───────────────────────────
+async fn handle_text_input(
+    key: KeyEvent,
+    app: &mut App,
+    store: &mut FileStore,
+    _guard: &TerminalGuard,
+) -> Result<(), AgySwitchError> {
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = Screen::AccountsMenu;
+            app.menu_idx = 0;
+            app.text_input.clear();
+            app.text_input_purpose = None;
+        }
+        KeyCode::Enter => {
+            let path_str = app.text_input.trim().to_string();
+            let purpose = app.text_input_purpose.take();
+
+            if path_str.is_empty() {
+                app.set_msg("No path entered", Color::Yellow);
+                app.screen = Screen::AccountsMenu;
+                app.menu_idx = 0;
+                return Ok(());
+            }
+
+            match purpose {
+                Some(TextInputPurpose::ImportJson) => {
+                    let path = std::path::PathBuf::from(&path_str);
+                    if !path.exists() {
+                        app.set_msg(format!("File not found: {}", path_str), Color::Red);
+                        app.screen = Screen::AccountsMenu;
+                        app.menu_idx = 0;
+                        return Ok(());
+                    }
+
+                    app.set_msg("Importing...".to_string(), Color::Yellow);
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
+                            })?;
+                        rt.block_on(async {
+                            let mut s = FileStore::new(crate::config::accounts_path());
+                            s.load().await?;
+                            let r = crate::commands::account_add::handle_add_json(&mut s, path).await?;
+                            Ok::<crate::commands::account_add::ImportResult, AgySwitchError>(r)
+                        })
+                    })
+                    .await;
+
+                    store.load().await.unwrap_or(());
+
+                    match result {
+                        Ok(Ok(r)) => {
+                            if r.errors.is_empty() {
+                                app.set_msg(format!("Import: {}", r.summary()), Color::Green);
+                            } else {
+                                app.set_msg(
+                                    format!("Import: {} | Errors: {}", r.summary(), r.errors[0]),
+                                    Color::Yellow,
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            app.set_msg(format!("Import failed: {}", e), Color::Red);
+                        }
+                        Err(e) => {
+                            app.set_msg(format!("Error: {}", e), Color::Red);
+                        }
+                    }
+
+                    app.screen = Screen::MainMenu;
+                    app.menu_idx = 1;
+                }
+                Some(TextInputPurpose::ExportJson) => {
+                    let path = std::path::PathBuf::from(&path_str);
+                    let accounts = store.list();
+
+                    if accounts.is_empty() {
+                        app.set_msg("No accounts to export", Color::Yellow);
+                        app.screen = Screen::MainMenu;
+                        app.menu_idx = 1;
+                        return Ok(());
+                    }
+
+                    let export_data: Vec<serde_json::Value> = accounts
+                        .iter()
+                        .map(|a| {
+                            let mut obj = serde_json::json!({
+                                "email": a.email,
+                                "access_token": a.credential.access_token,
+                                "refresh_token": a.credential.refresh_token,
+                                "expiry": a.credential.expiry.to_rfc3339(),
+                            });
+                            if let Some(l) = &a.label {
+                                obj["label"] = serde_json::json!(l);
+                            }
+                            if let Some(p) = &a.credential.project_id {
+                                obj["project_id"] = serde_json::json!(p);
+                            }
+                            obj
+                        })
+                        .collect();
+                    let export = serde_json::json!({
+                        "version": 1,
+                        "accounts": export_data,
+                    });
+                    let json = serde_json::to_string_pretty(&export).map_err(AgySwitchError::Json)?;
+
+                    match std::fs::write(&path, &json) {
+                        Ok(()) => {
+                            app.set_msg(
+                                format!("Exported {} accounts to {}", accounts.len(), path.display()),
+                                Color::Green,
+                            );
+                        }
+                        Err(e) => {
+                            app.set_msg(format!("Export failed: {}", e), Color::Red);
+                        }
+                    }
+
+                    app.screen = Screen::MainMenu;
+                    app.menu_idx = 1;
+                }
+                None => {
+                    app.screen = Screen::MainMenu;
+                    app.menu_idx = 1;
+                }
+            }
+            app.text_input.clear();
+        }
+        KeyCode::Backspace => {
+            app.text_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.text_input.push(c);
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 async fn handle_context_menu(
     key: KeyEvent,
@@ -1425,7 +1446,6 @@ async fn handle_context_menu(
         KeyCode::Down | KeyCode::Char('j') => menu_down(&mut app.menu_idx, CTX_MENU.len()),
         KeyCode::Enter => match app.menu_idx {
             0 => {
-                // Activate
                 if let Some(a) = store.list_sorted().get(app.list_idx).cloned() {
                     let account_clone = a.clone();
                     let result = tokio::task::spawn_blocking(move || {
@@ -1456,7 +1476,6 @@ async fn handle_context_menu(
                 app.screen = Screen::SwitchAccounts;
             }
             1 => {
-                // Remove
                 if let Some(a) = store.list_sorted().get(app.list_idx).cloned() {
                     let email = a.email.clone();
                     match crate::commands::account_remove::handle_remove(
@@ -1493,8 +1512,6 @@ async fn handle_context_menu(
     Ok(())
 }
 
-// ── Mode menu ───────────────────────────────────────────────
-
 fn handle_mode_menu(key: KeyEvent, app: &mut App, state: &mut AppState) {
     match key.code {
         KeyCode::Esc => {
@@ -1524,37 +1541,11 @@ fn handle_mode_menu(key: KeyEvent, app: &mut App, state: &mut AppState) {
     }
 }
 
-// ── Export menu ─────────────────────────────────────────────
-
-
-// ══════════════════════════════════════════════════════════════
-//  TUI EXIT / RE-ENTER
-// ══════════════════════════════════════════════════════════════
-
-fn exit_tui() {
-    let _ = disable_raw_mode();
-    let mut stdout = io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen);
-}
-
-fn re_enter_tui() -> Result<(), AgySwitchError> {
-    enable_raw_mode().map_err(io_err)?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(io_err)?;
-    Ok(())
-}
-
-// ══════════════════════════════════════════════════════════════
-//  HELPERS
-// ══════════════════════════════════════════════════════════════
-
-/// Compute a human-readable quota remaining string for an account list row.
 fn compute_quota_remaining_str(a: &crate::store::account::Account) -> String {
     if !a.enabled {
         return "disabled".to_string();
     }
     if a.is_rate_limited {
-        // Show countdown if we have a reset time
         if let Some(reset) = a.rate_limit_reset_at {
             let now = chrono::Utc::now();
             if reset > now {
@@ -1577,7 +1568,6 @@ fn compute_quota_remaining_str(a: &crate::store::account::Account) -> String {
         return "healthy".to_string();
     }
 
-    // Find the model with the lowest remaining fraction
     let mut min_pct: Option<u64> = None;
     for m in &quota.models {
         if let Some(frac) = m.remaining_fraction {
@@ -1593,7 +1583,6 @@ fn compute_quota_remaining_str(a: &crate::store::account::Account) -> String {
     }
 }
 
-/// Render a colored progress bar for quota.
 fn quota_bar(pct: u64) -> (String, Color) {
     let width = 10;
     let filled = ((pct as usize) * width / 100).min(width);
@@ -1602,10 +1591,10 @@ fn quota_bar(pct: u64) -> (String, Color) {
     let mut s = String::with_capacity(width + 2);
     s.push(' ');
     for _ in 0..filled {
-        s.push('\u{2588}'); // █
+        s.push('\u{2588}');
     }
     for _ in 0..empty {
-        s.push('\u{2591}'); // ░
+        s.push('\u{2591}');
     }
 
     let color = if pct > 60 {
