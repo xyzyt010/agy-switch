@@ -73,6 +73,66 @@ chmod +x agy-switch-macos-arm64
 sudo mv agy-switch-macos-arm64 /usr/local/bin/agy-switch
 ```
 
+## Update
+
+Re-run the same install command — it downloads the latest release and overwrites the old binary.
+
+### Windows
+
+```powershell
+# x64
+iwr -Uri "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-windows-x64.exe" -OutFile "$env:LOCALAPPDATA\bin\agy-switch.exe"
+
+# ARM64
+iwr -Uri "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-windows-arm64.exe" -OutFile "$env:LOCALAPPDATA\bin\agy-switch.exe"
+```
+
+### Linux (raw binary)
+
+```bash
+# ARM64
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-linux-arm64"
+chmod +x agy-switch-linux-arm64
+sudo mv agy-switch-linux-arm64 /usr/local/bin/agy-switch
+
+# x64
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-linux-x64"
+chmod +x agy-switch-linux-x64
+sudo mv agy-switch-linux-x64 /usr/local/bin/agy-switch
+```
+
+### Linux (Debian/Ubuntu)
+
+```bash
+# ARM64
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch_0.1.0_arm64.deb"
+sudo dpkg -i agy-switch_0.1.0_arm64.deb
+
+# x64
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch_0.1.0_amd64.deb"
+sudo dpkg -i agy-switch_0.1.0_amd64.deb
+```
+
+### Linux (Fedora/RHEL)
+
+```bash
+# ARM64
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-0.1.0-1.aarch64.rpm"
+sudo rpm -i agy-switch-0.1.0-1.aarch64.rpm
+
+# x64
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-0.1.0-1.x86_64.rpm"
+sudo rpm -i agy-switch-0.1.0-1.x86_64.rpm
+```
+
+### macOS (Apple Silicon)
+
+```bash
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-macos-arm64"
+chmod +x agy-switch-macos-arm64
+sudo mv agy-switch-macos-arm64 /usr/local/bin/agy-switch
+```
+
 ## Usage
 
 ```bash
