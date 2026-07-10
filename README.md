@@ -15,10 +15,13 @@ Antigravity account quota monitor, auto-switcher, and TUI dashboard.
 
 ## Install
 
-### Windows (PowerShell)
+### Windows
 
 ```powershell
-# Download the latest release
+# x64 (Intel/AMD)
+iwr -Uri "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-windows-x64.exe" -OutFile "$env:LOCALAPPDATA\bin\agy-switch.exe"
+
+# ARM64 (Surface Pro X, Snapdragon, etc.)
 iwr -Uri "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-windows-arm64.exe" -OutFile "$env:LOCALAPPDATA\bin\agy-switch.exe"
 ```
 
@@ -27,11 +30,11 @@ Or download manually from [Releases](https://github.com/xyzyt010/agy-switch/rele
 ### Linux (Debian/Ubuntu)
 
 ```bash
-# Download and install .deb
+# ARM64
 curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch_0.1.0_arm64.deb"
 sudo dpkg -i agy-switch_0.1.0_arm64.deb
 
-# Or for x64
+# x64
 curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch_0.1.0_amd64.deb"
 sudo dpkg -i agy-switch_0.1.0_amd64.deb
 ```
@@ -39,21 +42,27 @@ sudo dpkg -i agy-switch_0.1.0_amd64.deb
 ### Linux (Fedora/RHEL)
 
 ```bash
-# Download and install .rpm
+# ARM64
 curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-0.1.0-1.aarch64.rpm"
 sudo rpm -i agy-switch-0.1.0-1.aarch64.rpm
 
-# Or for x64
+# x64
 curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-0.1.0-1.x86_64.rpm"
 sudo rpm -i agy-switch-0.1.0-1.x86_64.rpm
 ```
 
-### Linux (raw binary)
+### Linux (raw binary — any distro with glibc ≥ 2.28)
 
 ```bash
+# ARM64
+curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-linux-arm64"
+chmod +x agy-switch-linux-arm64
+sudo mv agy-switch-linux-arm64 /usr/local/bin/agy-switch
+
+# x64
 curl -LO "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-linux-x64"
 chmod +x agy-switch-linux-x64
-./agy-switch-linux-x64 on
+sudo mv agy-switch-linux-x64 /usr/local/bin/agy-switch
 ```
 
 ### macOS (Apple Silicon)
