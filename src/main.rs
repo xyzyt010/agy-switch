@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if commands::on_off::is_daemon_running().await {
                 commands::dashboard::run_dashboard().await?;
             } else {
-                show_start_prompt().await?;
+                commands::on_off::turn_on().await?;
             }
         }
     }
