@@ -1,7 +1,7 @@
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 
-use crate::auth::oauth_flow::{client_id, client_secret, TOKEN_ENDPOINT};
+use crate::auth::oauth_flow::TOKEN_ENDPOINT;
 use crate::error::AgySwitchError;
 use crate::store::account::OAuthCredential;
 

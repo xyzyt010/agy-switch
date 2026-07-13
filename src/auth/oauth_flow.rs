@@ -16,10 +16,12 @@ pub fn client_secret() -> &'static str {
     "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"
 }
 
+#[allow(dead_code)]
 pub fn client_id_env() -> String {
     std::env::var("AGY_CLIENT_ID").unwrap_or_else(|_| client_id().into())
 }
 
+#[allow(dead_code)]
 pub fn client_secret_env() -> String {
     std::env::var("AGY_CLIENT_SECRET").unwrap_or_else(|_| client_secret().into())
 }

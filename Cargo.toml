@@ -1,6 +1,6 @@
 [package]
 name = "agy-switch"
-version = "0.1.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["AGY-SWITCH Contributors"]
 description = "Antigravity account monitor and switcher CLI"
@@ -53,6 +53,9 @@ rand = "0.8"
 
 # Open URLs in browser
 open = "5"
+
+# Clipboard
+arboard = "3"
 
 # URL encoding
 urlencoding = "2.1.3"

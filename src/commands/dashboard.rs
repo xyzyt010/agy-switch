@@ -56,6 +56,8 @@ enum Screen {
     TextInput,
 }
 
+use crate::commands::account_add::ImportResult;
+
 enum TextInputPurpose {
     ImportJson,
     ExportJson,
@@ -115,6 +117,8 @@ const MAIN_MENU: &[&str] = &[
 const ACCOUNTS_MENU: &[&str] = &[
     "Import from JSON",
     "Export to JSON",
+    "Paste accounts JSON (Clipboard)",
+    "Copy accounts JSON (Clipboard)",
     "Login via OAuth",
 ];
 
@@ -184,6 +188,13 @@ async fn run_loop(
             if last_disk_reload.elapsed() >= disk_reload_interval {
                 last_disk_reload = std::time::Instant::now();
                 let _ = store.load().await;
+                // Clamp list_idx to valid range after reload
+                let count = store.count();
+                if count == 0 {
+                    app.list_idx = 0;
+                } else if app.list_idx >= count {
+                    app.list_idx = count - 1;
+                }
             }
 
             if last_api_refresh.elapsed() >= api_refresh_interval {
@@ -1236,6 +1247,167 @@ async fn handle_accounts_menu(
                 app.screen = Screen::TextInput;
             }
             2 => {
+                // Import from clipboard
+                match arboard::Clipboard::new() {
+                    Ok(mut clipboard) => {
+                        match clipboard.get_text() {
+                            Ok(text) => {
+                                if text.trim().is_empty() {
+                                    app.set_msg("Clipboard is empty", Color::Yellow);
+                                } else {
+                                    app.set_msg("Importing from clipboard...".to_string(), Color::Yellow);
+                                    let text_owned = text.to_string();
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        let rt = tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .map_err(|e| {
+                                                AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
+                                            })?;
+                                        rt.block_on(async {
+                                            let mut s = FileStore::new(crate::config::accounts_path());
+                                            s.load().await?;
+                                            let bytes = text_owned.into_bytes();
+                                            let accounts_data: serde_json::Value =
+                                                serde_json::from_slice(&bytes)
+                                                    .map_err(|e| AgySwitchError::OAuthFailed(format!("JSON parse: {}", e)))?;
+                                            let accounts_arr = accounts_data
+                                                .get("accounts")
+                                                .and_then(|v| v.as_array())
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            if accounts_arr.is_empty() {
+                                                return Err(AgySwitchError::OAuthFailed("No accounts in JSON".to_string()));
+                                            }
+                                            let mut errors = Vec::new();
+                                            let mut imported = 0;
+                                            for (i, acct) in accounts_arr.iter().enumerate() {
+                                                let email = acct.get("email").and_then(|v| v.as_str()).unwrap_or("");
+                                                let access_token = acct.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
+                                                let refresh_token = acct.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("");
+                                                if email.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
+                                                    errors.push(format!("Account {} missing fields", i + 1));
+                                                    continue;
+                                                }
+                                                let label = acct.get("label").and_then(|v| v.as_str()).map(String::from);
+                                                let project_id = acct.get("project_id").and_then(|v| v.as_str()).map(String::from);
+                                                let expiry_str = acct.get("expiry").and_then(|v| v.as_str()).unwrap_or("");
+                                                let expiry = chrono::DateTime::parse_from_rfc3339(expiry_str)
+                                                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                                                    .unwrap_or_else(|_| chrono::Utc::now() + chrono::Duration::hours(1));
+                                                let credential = crate::store::account::OAuthCredential {
+                                                    access_token: access_token.to_string(),
+                                                    refresh_token: refresh_token.to_string(),
+                                                    project_id,
+                                                    managed_project_id: None,
+                                                    expiry,
+                                                };
+                                                let account = crate::store::account::Account {
+                                                    id: uuid::Uuid::new_v4(),
+                                                    email: email.to_string(),
+                                                    label,
+                                                    credential,
+                                                    quota: None,
+                                                    added_at: chrono::Utc::now(),
+                                                    last_used_at: None,
+                                                    is_rate_limited: false,
+                                                    rate_limit_reset_at: None,
+                                                    enabled: true,
+                                                };
+                                                if s.add(account).await.is_ok() {
+                                                    imported += 1;
+                                                }
+                                            }
+                                            s.flush().await?;
+                                            Ok::<ImportResult, AgySwitchError>(ImportResult { imported, updated: 0, skipped: 0, errors })
+                                        })
+                                    })
+                                    .await;
+                                    store.load().await.unwrap_or(());
+                                    match result {
+                                        Ok(Ok(r)) => {
+                                            if r.errors.is_empty() {
+                                                app.set_msg(format!("Imported: {}", r.summary()), Color::Green);
+                                            } else {
+                                                app.set_msg(
+                                                    format!("Imported: {} | Errors: {}", r.summary(), r.errors[0]),
+                                                    Color::Yellow,
+                                                );
+                                            }
+                                        }
+                                        Ok(Err(e)) => {
+                                            app.set_msg(format!("Import failed: {}", e), Color::Red);
+                                        }
+                                        Err(e) => {
+                                            app.set_msg(format!("Error: {}", e), Color::Red);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.set_msg(format!("Clipboard read failed: {}", e), Color::Red);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.set_msg(format!("Clipboard unavailable: {}", e), Color::Red);
+                    }
+                }
+            }
+            3 => {
+                // Export to clipboard
+                let accounts = store.list();
+                if accounts.is_empty() {
+                    app.set_msg("No accounts to export", Color::Yellow);
+                } else {
+                    let export_data: Vec<serde_json::Value> = accounts
+                        .iter()
+                        .map(|a| {
+                            let mut obj = serde_json::json!({
+                                "email": a.email,
+                                "access_token": a.credential.access_token,
+                                "refresh_token": a.credential.refresh_token,
+                                "expiry": a.credential.expiry.to_rfc3339(),
+                            });
+                            if let Some(l) = &a.label {
+                                obj["label"] = serde_json::json!(l);
+                            }
+                            if let Some(p) = &a.credential.project_id {
+                                obj["project_id"] = serde_json::json!(p);
+                            }
+                            obj
+                        })
+                        .collect();
+                    let export = serde_json::json!({
+                        "version": 1,
+                        "accounts": export_data,
+                    });
+                    match serde_json::to_string_pretty(&export) {
+                        Ok(json) => match arboard::Clipboard::new() {
+                            Ok(mut clipboard) => {
+                                match clipboard.set_text(&json) {
+                                    Ok(()) => {
+                                        app.set_msg(
+                                            format!("Copied {} accounts to clipboard", accounts.len()),
+                                            Color::Green,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        app.set_msg(format!("Clipboard write failed: {}", e), Color::Red);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.set_msg(format!("Clipboard unavailable: {}", e), Color::Red);
+                            }
+                        },
+                        Err(e) => {
+                            app.set_msg(format!("JSON error: {}", e), Color::Red);
+                        }
+                    }
+                }
+            }
+            4 => {
                 guard.disarm();
                 let _ = disable_raw_mode();
                 let mut stdout = io::stdout();
@@ -1562,10 +1734,10 @@ fn compute_quota_remaining_str(a: &crate::store::account::Account) -> String {
         return "rate limited".to_string();
     }
     let Some(quota) = &a.quota else {
-        return "healthy".to_string();
+        return "unknown".to_string();
     };
     if quota.models.is_empty() {
-        return "healthy".to_string();
+        return "unknown".to_string();
     }
 
     let mut min_pct: Option<u64> = None;
@@ -1579,7 +1751,7 @@ fn compute_quota_remaining_str(a: &crate::store::account::Account) -> String {
     match min_pct {
         Some(pct) if pct <= 0 => "exhausted".to_string(),
         Some(pct) => format!("{}% left", pct),
-        None => "healthy".to_string(),
+        None => "unknown".to_string(),
     }
 }
 

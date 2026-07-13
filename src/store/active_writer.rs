@@ -970,8 +970,40 @@ pub async fn import_from_official_tools(
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        // Quota is not read from official files — they are unreliable.
-        // New accounts start with no quota data (shown as "Unknown" until log detection fires).
+        // Read quota from official files as initial data (converted to our schema)
+        let quota = account_data.get("quota").and_then(|q| {
+            let models_arr = q.get("models").and_then(|m| m.as_array())?;
+            let models: Vec<crate::quota::models::ModelQuota> = models_arr
+                .iter()
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(|v| v.as_str())?.to_string();
+                    let display_name = m.get("display_name").and_then(|v| v.as_str()).unwrap_or(&name).to_string();
+                    let percentage = m.get("percentage").and_then(|v| v.as_i64()).unwrap_or(100);
+                    let remaining_fraction = Some((percentage as f64) / 100.0);
+                    let is_exhausted = percentage <= 0;
+                    let reset_at = m.get("reset_time")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+                    Some(crate::quota::models::ModelQuota {
+                        model_id: name,
+                        display_name,
+                        remaining_fraction,
+                        reset_at,
+                        is_exhausted,
+                    })
+                })
+                .collect();
+            if models.is_empty() {
+                None
+            } else {
+                Some(crate::quota::models::QuotaSnapshot {
+                    fetched_at: chrono::Utc::now(),
+                    models,
+                })
+            }
+        });
+
         let credential = crate::store::account::OAuthCredential {
             access_token,
             refresh_token,
@@ -985,7 +1017,7 @@ pub async fn import_from_official_tools(
             email: official_email,
             label,
             credential,
-            quota: None,
+            quota,
             added_at: chrono::Utc::now(),
             last_used_at: None,
             is_rate_limited: false,
