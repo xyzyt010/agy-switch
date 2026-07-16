@@ -5,7 +5,8 @@ use std::time::Duration;
 
 /// Run the daemon loop
 pub async fn run_daemon() -> Result<(), AgySwitchError> {
-    eprintln!("[AGY-SWITCH] Daemon starting...");
+    // Silence stdout/stderr for daemon mode — all logging goes to log file via parent
+    // (on Linux, stdio is redirected to /dev/null by the double-fork)
 
     let stop_path = app_config_dir().join("stop.signal");
     let mut tick = 0u64;

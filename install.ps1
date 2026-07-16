@@ -3,10 +3,10 @@
 
 $ErrorActionPreference = "Stop"
 
-$dest = "$env:LOCALAPPDATA\bin"
+$dest = "$env:LOCALAPPDATA\agy\bin"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
-# Copy both binary names
+# Copy binary
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path $scriptDir "agy-switch.exe"
 
@@ -17,8 +17,7 @@ if (-not (Test-Path $src)) {
 }
 
 Copy-Item $src "$dest\agy-switch.exe" -Force
-Copy-Item $src "$dest\agy.exe" -Force
-Write-Host "Copied agy-switch.exe and agy.exe to $dest" -ForegroundColor Green
+Write-Host "Copied agy-switch.exe to $dest" -ForegroundColor Green
 
 # Add to PATH if not already there
 $currentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
@@ -35,4 +34,4 @@ New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 Write-Host "Created config directory: $configDir" -ForegroundColor Cyan
 
 Write-Host "`nInstallation complete!" -ForegroundColor Green
-Write-Host "Run 'agy-switch --version' to verify." -ForegroundColor Cyan
+Write-Host "Run 'agy-switch --help' to get started." -ForegroundColor Cyan

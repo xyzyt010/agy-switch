@@ -96,11 +96,60 @@ pub fn spawn_daemon() -> Result<(), AgySwitchError> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let child = Command::new(current_exe)
-            .arg("__daemon")
-            .spawn()
-            .map_err(AgySwitchError::Io)?;
-        std::fs::write(&pid_path, child.id().to_string()).map_err(AgySwitchError::Io)?;
+        // Double-fork + setsid to fully detach from parent terminal.
+        // Without this, the daemon dies when the TUI closes (SIGHUP from terminal).
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                return Err(AgySwitchError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "fork failed",
+                )));
+            }
+            if pid > 0 {
+                // Parent process: write child PID and exit
+                std::fs::write(&pid_path, pid.to_string()).map_err(AgySwitchError::Io)?;
+                return Ok(());
+            }
+
+            // First child: create new session (detach from terminal)
+            libc::setsid();
+
+            // Second fork: prevent the daemon from acquiring a controlling terminal
+            let pid2 = libc::fork();
+            if pid2 < 0 {
+                libc::_exit(1);
+            }
+            if pid2 > 0 {
+                // First child exits, grandchild continues as daemon
+                libc::_exit(0);
+            }
+
+            // Grandchild (daemon): redirect stdio to /dev/null
+            let devnull = b"/dev/null\0".as_ptr() as *const libc::c_char;
+            libc::close(libc::STDIN_FILENO);
+            libc::close(libc::STDOUT_FILENO);
+            libc::close(libc::STDERR_FILENO);
+            libc::open(devnull, libc::O_RDWR); // fd 0 = stdin
+            libc::dup(0); // fd 1 = stdout
+            libc::dup(0); // fd 2 = stderr
+
+            // Write our own PID
+            let self_pid = libc::getpid();
+            let _ = std::fs::write(&pid_path, self_pid.to_string());
+
+            // Set working directory to root
+            let _ = std::env::set_current_dir("/");
+
+            // Exec the daemon binary
+            use std::os::unix::process::CommandExt;
+            Command::new(current_exe)
+                .arg("__daemon")
+                .exec();
+
+            // exec failed
+            libc::_exit(1);
+        }
     }
 
     Ok(())

@@ -1,4 +1,8 @@
 /target
+/dist
 *.pdb
 *.log
-dist/
+*.exe
+*.dll
+*.so
+*.dylib

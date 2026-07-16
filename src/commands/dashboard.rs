@@ -1067,7 +1067,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         Line::from("    Enter               Select / Activate account"),
         Line::from("    Esc                 Go back to previous screen"),
         Line::from("    R                   Refresh quota for all accounts"),
-        Line::from("    x / Delete          Remove selected account"),
+        Line::from("    r                   Remove selected account"),
         Line::from("    Ctrl+C              Force quit"),
         Line::from(""),
         Line::from(Span::styled(
