@@ -207,6 +207,11 @@ pub fn stop_daemon() -> Result<(), AgySwitchError> {
 
 /// Turn on: start daemon + launch TUI
 pub async fn turn_on() -> Result<(), AgySwitchError> {
+    // Set state.enabled = true so TUI shows "ON"
+    let mut state = crate::config::load_state().await.unwrap_or_default();
+    state.enabled = true;
+    let _ = crate::config::save_state(&state).await;
+
     // Start daemon
     match spawn_daemon() {
         Ok(()) => {
@@ -224,6 +229,11 @@ pub async fn turn_on() -> Result<(), AgySwitchError> {
 
 /// Turn off: stop daemon + exit
 pub async fn turn_off() -> Result<(), AgySwitchError> {
+    // Set state.enabled = false
+    let mut state = crate::config::load_state().await.unwrap_or_default();
+    state.enabled = false;
+    let _ = crate::config::save_state(&state).await;
+
     match stop_daemon() {
         Ok(()) => {
             println!("[AGY-SWITCH] Stopped");
