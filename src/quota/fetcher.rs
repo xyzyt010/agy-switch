@@ -91,12 +91,8 @@ async fn fetch_available_models(
         }
 
         let text = resp.text().await.unwrap_or_default();
-        eprintln!(
-            "[AGY-SWITCH] fetchAvailableModels failed at {} ({}): {}",
-            endpoint,
-            status,
-            &text[..text.len().min(200)]
-        );
+        let _ = (endpoint, status, &text); // suppressed — was leaking into TUI
+        return Err(AgySwitchError::OAuthFailed(format!("fetchAvailableModels {}: {}", status, &text[..text.len().min(200)])));
     }
 
     Err(AgySwitchError::OAuthFailed(
@@ -141,12 +137,8 @@ async fn retrieve_user_quota(
         }
 
         let text = resp.text().await.unwrap_or_default();
-        eprintln!(
-            "[AGY-SWITCH] retrieveUserQuota failed at {} ({}): {}",
-            endpoint,
-            status,
-            &text[..text.len().min(200)]
-        );
+        let _ = (endpoint, status, &text); // suppressed
+        return Err(AgySwitchError::OAuthFailed(format!("retrieveUserQuota {}: {}", status, &text[..text.len().min(200)])));
     }
 
     Err(AgySwitchError::OAuthFailed(
@@ -185,12 +177,8 @@ async fn load_code_assist(
         }
 
         let text = resp.text().await.unwrap_or_default();
-        eprintln!(
-            "[AGY-SWITCH] loadCodeAssist failed at {} ({}): {}",
-            endpoint,
-            status,
-            &text[..text.len().min(200)]
-        );
+        let _ = (endpoint, status, &text); // suppressed
+        return Err(AgySwitchError::OAuthFailed(format!("loadCodeAssist {}: {}", status, &text[..text.len().min(200)])));
     }
 
     Err(AgySwitchError::OAuthFailed(
@@ -295,8 +283,8 @@ pub async fn get_model_quotas(
             }
             // If buckets parsing failed, fall through to fetchAvailableModels
         }
-        Err(e) => {
-            eprintln!("[AGY-SWITCH] retrieveUserQuota failed: {}, falling back to fetchAvailableModels", e);
+        Err(_) => {
+            // Suppressed: previously eprintln'd here, leaked into TUI
         }
     }
 

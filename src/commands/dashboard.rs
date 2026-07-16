@@ -54,6 +54,8 @@ enum Screen {
     ModeMenu,
     Help,
     TextInput,
+    /// Shows JSON extracted from clipboard; Enter confirms import, Esc cancels
+    PasteConfirm,
 }
 
 use crate::commands::account_add::ImportResult;
@@ -71,6 +73,10 @@ struct App {
     msg: String,
     msg_color: Color,
 
+    /// Transient toast shown top-right (e.g. "Copied to clipboard")
+    toast: Option<String>,
+    toast_until: Option<std::time::Instant>,
+
     active_account_id: Option<Uuid>,
     mode: SwitchMode,
 
@@ -80,6 +86,11 @@ struct App {
 
     text_input: String,
     text_input_purpose: Option<TextInputPurpose>,
+
+    /// Scroll offset for paste-confirm screen
+    paste_scroll: usize,
+    /// Stored JSON text for paste-confirm review (set before entering that screen)
+    paste_json_buffer: String,
 }
 
 impl App {
@@ -91,18 +102,39 @@ impl App {
             quit: false,
             msg: String::new(),
             msg_color: Color::DarkGray,
+            toast: None,
+            toast_until: None,
             active_account_id: state.active_account_id,
             mode: state.mode.clone(),
             list_scroll_offset: 0,
             last_quota_refresh: None,
             text_input: String::new(),
             text_input_purpose: None,
+            paste_scroll: 0,
+            paste_json_buffer: String::new(),
         }
     }
 
     fn set_msg(&mut self, msg: impl Into<String>, color: Color) {
         self.msg = msg.into();
         self.msg_color = color;
+    }
+
+    fn set_toast(&mut self, msg: impl Into<String>) {
+        let s: String = msg.into();
+        let pad = 24usize.saturating_sub(s.len());
+        let padded = format!("{}{}", s, " ".repeat(pad));
+        self.toast = Some(padded);
+        self.toast_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    }
+
+    fn clear_toast_if_expired(&mut self) {
+        if let Some(when) = self.toast_until {
+            if std::time::Instant::now() > when {
+                self.toast = None;
+                self.toast_until = None;
+            }
+        }
     }
 }
 
@@ -132,6 +164,9 @@ const CTX_MENU: &[&str] = &[
     "Remove this account",
     "Back",
 ];
+
+/// Hard limit on number of accounts. Used to refuse new logins/imports beyond.
+const MAX_ACCOUNTS: usize = 150;
 
 pub async fn run_dashboard() -> Result<(), AgySwitchError> {
     let mut store = FileStore::new(crate::config::accounts_path());
@@ -195,6 +230,7 @@ async fn run_loop(
                 } else if app.list_idx >= count {
                     app.list_idx = count - 1;
                 }
+                app.clear_toast_if_expired();
             }
 
             if last_api_refresh.elapsed() >= api_refresh_interval {
@@ -225,7 +261,7 @@ async fn run_loop(
         match app.screen {
             Screen::MainMenu => handle_main_menu(key, app, store, state).await?,
             Screen::SwitchAccounts => handle_switch_accounts(key, app, store, state).await?,
-            Screen::AccountsMenu => handle_accounts_menu(key, app, store, state, guard).await?,
+            Screen::AccountsMenu => handle_accounts_menu(key, app, store, state, guard, term).await?,
             Screen::ContextMenu => handle_context_menu(key, app, store, state).await?,
             Screen::ModeMenu => handle_mode_menu(key, app, state),
             Screen::Help => {
@@ -235,12 +271,36 @@ async fn run_loop(
                 }
             }
             Screen::TextInput => handle_text_input(key, app, store, guard).await?,
+            Screen::PasteConfirm => handle_paste_confirm(key, app, store).await?,
         }
 
         if app.quit {
             break;
         }
     }
+    Ok(())
+}
+
+/// Disarm the terminal: leave alt screen, disable raw mode.
+/// Call `rearm_terminal` to resume. Best-effort.
+fn disarm_terminal(guard: &TerminalGuard) {
+    guard.disarm();
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
+}
+
+/// Re-arm the terminal: re-enter alt screen, re-enable raw mode, clear cache.
+fn rearm_terminal(
+    guard: &TerminalGuard,
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), AgySwitchError> {
+    enable_raw_mode().map_err(io_err)?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).map_err(io_err)?;
+    guard.active.set(true);
+    // Invalidate the backend diff cache so the next draw repaints everything
+    term.clear().map_err(io_err)?;
     Ok(())
 }
 
@@ -264,6 +324,11 @@ fn render(
         draw_header(f, chunks[0], store, state);
         draw_content(f, chunks[1], store, state, app);
         draw_status_bar(f, chunks[2], app, store, state);
+
+        // Toast overlay (top-right). Drawn last to overlay on top of header.
+        if app.toast.is_some() {
+            draw_toast(f, area, app);
+        }
     })
     .map_err(io_err)?;
     Ok(())
@@ -377,6 +442,7 @@ fn draw_content(
         Screen::ModeMenu => draw_mode_menu(f, area, state, app),
         Screen::Help => draw_help(f, area),
         Screen::TextInput => draw_text_input(f, area, app),
+        Screen::PasteConfirm => draw_paste_confirm(f, area, app),
     }
 }
 
@@ -638,11 +704,99 @@ fn draw_switch_accounts(
                 Block::default()
                     .title(" Details ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(Color::Cyan)),
             ),
-            h[1],
+            area,
         );
     }
+}
+
+/// Top-right transient toast (e.g. "Copied to clipboard"). Auto-expires after 3s.
+fn draw_toast(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(msg) = &app.toast else { return };
+    // Width: 32, Height: 3, top-right
+    let w: u16 = 32;
+    let h: u16 = 3;
+    let x = area.width.saturating_sub(w).saturating_sub(1);
+    let y: u16 = 1;
+    let rect = Rect::new(x, y, w.min(area.width), h);
+    let clear = ratatui::widgets::Clear;
+    f.render_widget(clear, rect);
+    let para = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" \u{2714} {} ", msg.trim_end()),
+            Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD),
+        )),
+    ]);
+    f.render_widget(
+        para,
+        rect,
+    );
+}
+
+/// Scrollable text box showing clipboard JSON. Enter = confirm import, Esc = cancel.
+fn draw_paste_confirm(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    // Layout: instructions (3) + scrollable JSON (fill) + status (1)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(4), Constraint::Length(1)])
+        .split(area);
+
+    let header = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Clipboard contents:",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "  \u{2191}\u{2193} Scroll   Enter Confirm Import   Esc Cancel",
+            Style::default().fg(Color::Yellow),
+        )),
+    ])
+    .block(
+        Block::default()
+            .title(" Paste Accounts JSON ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(header, chunks[0]);
+
+    let lines: Vec<Line> = app
+        .paste_json_buffer
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))))
+        .collect();
+
+    let visible_h = (chunks[1].height as usize).saturating_sub(2);
+    let total = lines.len();
+    if app.paste_scroll > total.saturating_sub(1) && total > 0 {
+        // (read-only clone; can't mutate app here)
+    }
+    let start = app.paste_scroll.min(total.saturating_sub(1));
+    let end = (start + visible_h).min(total);
+    let slice: Vec<Line> = lines.into_iter().skip(start).take(end - start).collect();
+
+    let content = Paragraph::new(slice).block(
+        Block::default()
+            .title(Span::styled(
+                format!(" JSON (lines {}-{} of {}) ", start + 1, end, total),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(content, chunks[1]);
+
+    let status = Paragraph::new(Line::from(Span::styled(
+        format!(
+            " Scroll: {} / {}   \u{2191}\u{2193} Continue scrolling   Enter Import   Esc Back ",
+            start + 1,
+            total
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(status, chunks[2]);
 }
 
 fn draw_detail_pane(
@@ -999,6 +1153,7 @@ fn draw_status_bar(
         Screen::ModeMenu => " \u{2191}\u{2193} Navigate   Enter Select   Esc Back ",
         Screen::Help => " Enter/Esc Back ",
         Screen::TextInput => " Type path   Enter Confirm   Esc Cancel ",
+        Screen::PasteConfirm => " \u{2191}\u{2193} Scroll   Enter Import   Esc Cancel ",
     };
 
     let mem_kb = store.memory_usage() / 1024;
@@ -1227,6 +1382,7 @@ async fn handle_accounts_menu(
     store: &mut FileStore,
     _state: &mut AppState,
     guard: &TerminalGuard,
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<(), AgySwitchError> {
     match key.code {
         KeyCode::Esc => {
@@ -1237,216 +1393,143 @@ async fn handle_accounts_menu(
         KeyCode::Down | KeyCode::Char('j') => menu_down(&mut app.menu_idx, ACCOUNTS_MENU.len()),
         KeyCode::Enter => match app.menu_idx {
             0 => {
+                // Import from JSON file (path prompt)
                 app.text_input.clear();
                 app.text_input_purpose = Some(TextInputPurpose::ImportJson);
                 app.screen = Screen::TextInput;
             }
             1 => {
+                // Export to JSON file (path prompt)
                 app.text_input.clear();
                 app.text_input_purpose = Some(TextInputPurpose::ExportJson);
                 app.screen = Screen::TextInput;
             }
             2 => {
-                // Import from clipboard
-                match arboard::Clipboard::new() {
-                    Ok(mut clipboard) => {
-                        match clipboard.get_text() {
-                            Ok(text) => {
-                                if text.trim().is_empty() {
-                                    app.set_msg("Clipboard is empty", Color::Yellow);
-                                } else {
-                                    app.set_msg("Importing from clipboard...".to_string(), Color::Yellow);
-                                    let text_owned = text.to_string();
-                                    let result = tokio::task::spawn_blocking(move || {
-                                        let rt = tokio::runtime::Builder::new_current_thread()
-                                            .enable_all()
-                                            .build()
-                                            .map_err(|e| {
-                                                AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
-                                            })?;
-                                        rt.block_on(async {
-                                            let mut s = FileStore::new(crate::config::accounts_path());
-                                            s.load().await?;
-                                            let bytes = text_owned.into_bytes();
-                                            let accounts_data: serde_json::Value =
-                                                serde_json::from_slice(&bytes)
-                                                    .map_err(|e| AgySwitchError::OAuthFailed(format!("JSON parse: {}", e)))?;
-                                            let accounts_arr = accounts_data
-                                                .get("accounts")
-                                                .and_then(|v| v.as_array())
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if accounts_arr.is_empty() {
-                                                return Err(AgySwitchError::OAuthFailed("No accounts in JSON".to_string()));
-                                            }
-                                            let mut errors = Vec::new();
-                                            let mut imported = 0;
-                                            for (i, acct) in accounts_arr.iter().enumerate() {
-                                                let email = acct.get("email").and_then(|v| v.as_str()).unwrap_or("");
-                                                let access_token = acct.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
-                                                let refresh_token = acct.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("");
-                                                if email.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
-                                                    errors.push(format!("Account {} missing fields", i + 1));
-                                                    continue;
-                                                }
-                                                let label = acct.get("label").and_then(|v| v.as_str()).map(String::from);
-                                                let project_id = acct.get("project_id").and_then(|v| v.as_str()).map(String::from);
-                                                let expiry_str = acct.get("expiry").and_then(|v| v.as_str()).unwrap_or("");
-                                                let expiry = chrono::DateTime::parse_from_rfc3339(expiry_str)
-                                                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                                                    .unwrap_or_else(|_| chrono::Utc::now() + chrono::Duration::hours(1));
-                                                let credential = crate::store::account::OAuthCredential {
-                                                    access_token: access_token.to_string(),
-                                                    refresh_token: refresh_token.to_string(),
-                                                    project_id,
-                                                    managed_project_id: None,
-                                                    expiry,
-                                                };
-                                                let account = crate::store::account::Account {
-                                                    id: uuid::Uuid::new_v4(),
-                                                    email: email.to_string(),
-                                                    label,
-                                                    credential,
-                                                    quota: None,
-                                                    added_at: chrono::Utc::now(),
-                                                    last_used_at: None,
-                                                    is_rate_limited: false,
-                                                    rate_limit_reset_at: None,
-                                                    enabled: true,
-                                                };
-                                                if s.add(account).await.is_ok() {
-                                                    imported += 1;
-                                                }
-                                            }
-                                            s.flush().await?;
-                                            Ok::<ImportResult, AgySwitchError>(ImportResult { imported, updated: 0, skipped: 0, errors })
-                                        })
-                                    })
-                                    .await;
-                                    store.load().await.unwrap_or(());
-                                    match result {
-                                        Ok(Ok(r)) => {
-                                            if r.errors.is_empty() {
-                                                app.set_msg(format!("Imported: {}", r.summary()), Color::Green);
-                                            } else {
-                                                app.set_msg(
-                                                    format!("Imported: {} | Errors: {}", r.summary(), r.errors[0]),
-                                                    Color::Yellow,
-                                                );
-                                            }
-                                        }
-                                        Ok(Err(e)) => {
-                                            app.set_msg(format!("Import failed: {}", e), Color::Red);
-                                        }
-                                        Err(e) => {
-                                            app.set_msg(format!("Error: {}", e), Color::Red);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                app.set_msg(format!("Clipboard read failed: {}", e), Color::Red);
-                            }
+                // Paste accounts JSON from clipboard → review in scrollable text box
+                if store.count() >= MAX_ACCOUNTS {
+                    app.set_msg(format!("Limit reached ({}). Remove accounts first.", MAX_ACCOUNTS), Color::Red);
+                    return Ok(());
+                }
+                let text = match arboard::Clipboard::new() {
+                    Ok(mut cb) => match cb.get_text() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            app.set_msg(format!("Clipboard read failed: {}", e), Color::Red);
+                            return Ok(());
                         }
+                    },
+                    Err(e) => {
+                        app.set_msg(format!("Clipboard unavailable: {}", e), Color::Red);
+                        return Ok(());
                     }
+                };
+                if text.trim().is_empty() {
+                    app.set_msg("Clipboard is empty", Color::Yellow);
+                    return Ok(());
+                }
+                // Try to parse as JSON before showing — if invalid, show error
+                let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        app.set_msg(format!("Invalid JSON: {}", e), Color::Red);
+                        return Ok(());
+                    }
+                };
+                let accounts_arr = parsed
+                    .get("accounts")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if accounts_arr.is_empty() {
+                    app.set_msg("No accounts found in clipboard JSON", Color::Yellow);
+                    return Ok(());
+                }
+                app.paste_json_buffer = text;
+                app.paste_scroll = 0;
+                app.screen = Screen::PasteConfirm;
+            }
+            3 => {
+                // Copy accounts JSON to clipboard
+                let accounts = store.list();
+                if accounts.is_empty() {
+                    app.set_msg("No accounts to export", Color::Yellow);
+                    return Ok(());
+                }
+                let export_data: Vec<serde_json::Value> = accounts
+                    .iter()
+                    .map(|a| {
+                        let mut obj = serde_json::json!({
+                            "email": a.email,
+                            "access_token": a.credential.access_token,
+                            "refresh_token": a.credential.refresh_token,
+                            "expiry": a.credential.expiry.to_rfc3339(),
+                        });
+                        if let Some(l) = &a.label {
+                            obj["label"] = serde_json::json!(l);
+                        }
+                        if let Some(p) = &a.credential.project_id {
+                            obj["project_id"] = serde_json::json!(p);
+                        }
+                        obj
+                    })
+                    .collect();
+                let export = serde_json::json!({
+                    "version": 1,
+                    "accounts": export_data,
+                });
+                let json = match serde_json::to_string_pretty(&export) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        app.set_msg(format!("JSON error: {}", e), Color::Red);
+                        return Ok(());
+                    }
+                };
+                match arboard::Clipboard::new() {
+                    Ok(mut cb) => match cb.set_text(&json) {
+                        Ok(()) => {
+                            app.set_toast(format!("Copied {} accounts to clipboard", accounts.len()));
+                        }
+                        Err(e) => {
+                            app.set_msg(format!("Clipboard write failed: {}", e), Color::Red);
+                        }
+                    },
                     Err(e) => {
                         app.set_msg(format!("Clipboard unavailable: {}", e), Color::Red);
                     }
                 }
             }
-            3 => {
-                // Export to clipboard
-                let accounts = store.list();
-                if accounts.is_empty() {
-                    app.set_msg("No accounts to export", Color::Yellow);
-                } else {
-                    let export_data: Vec<serde_json::Value> = accounts
-                        .iter()
-                        .map(|a| {
-                            let mut obj = serde_json::json!({
-                                "email": a.email,
-                                "access_token": a.credential.access_token,
-                                "refresh_token": a.credential.refresh_token,
-                                "expiry": a.credential.expiry.to_rfc3339(),
-                            });
-                            if let Some(l) = &a.label {
-                                obj["label"] = serde_json::json!(l);
-                            }
-                            if let Some(p) = &a.credential.project_id {
-                                obj["project_id"] = serde_json::json!(p);
-                            }
-                            obj
-                        })
-                        .collect();
-                    let export = serde_json::json!({
-                        "version": 1,
-                        "accounts": export_data,
-                    });
-                    match serde_json::to_string_pretty(&export) {
-                        Ok(json) => match arboard::Clipboard::new() {
-                            Ok(mut clipboard) => {
-                                match clipboard.set_text(&json) {
-                                    Ok(()) => {
-                                        app.set_msg(
-                                            format!("Copied {} accounts to clipboard", accounts.len()),
-                                            Color::Green,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        app.set_msg(format!("Clipboard write failed: {}", e), Color::Red);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                app.set_msg(format!("Clipboard unavailable: {}", e), Color::Red);
-                            }
-                        },
-                        Err(e) => {
-                            app.set_msg(format!("JSON error: {}", e), Color::Red);
-                        }
-                    }
-                }
-            }
             4 => {
-                guard.disarm();
-                let _ = disable_raw_mode();
-                let mut stdout = io::stdout();
-                let _ = execute!(stdout, LeaveAlternateScreen);
+                // Login via OAuth
+                if store.count() >= MAX_ACCOUNTS {
+                    app.set_msg(format!("Limit reached ({}). Cannot add more.", MAX_ACCOUNTS), Color::Red);
+                    return Ok(());
+                }
+
+                disarm_terminal(guard);
 
                 eprintln!("[AGY-SWITCH] Opening browser for OAuth login...");
                 eprintln!("[AGY-SWITCH] Complete the login in your browser.");
                 eprintln!("[AGY-SWITCH] Waiting for callback...");
 
-                let result = tokio::task::spawn_blocking(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
-                        })?;
-                    rt.block_on(crate::commands::account_add::add_oauth_account(
-                        &mut FileStore::new(crate::config::accounts_path()),
-                    ))
-                })
-                .await;
+                // Use Handle::current() to reuse the existing runtime (no nested runtime).
+                // This is safe because disarm_terminal has already left the alt screen,
+                // so the TUI is not driving crossterm::event::poll concurrently.
+                let result = {
+                    let mut s = FileStore::new(crate::config::accounts_path());
+                    s.load().await?;
+                    crate::commands::account_add::add_oauth_account(&mut s).await
+                };
 
                 store.load().await.unwrap_or(());
 
-                enable_raw_mode().map_err(io_err)?;
-                let mut stdout = io::stdout();
-                execute!(stdout, EnterAlternateScreen).map_err(io_err)?;
-
-                guard.active.set(true);
+                rearm_terminal(guard, term)?;
 
                 match result {
-                    Ok(Ok(email)) => {
+                    Ok(email) => {
                         app.set_msg(format!("Added: {}", email), Color::Green);
                     }
-                    Ok(Err(e)) => {
-                        app.set_msg(format!("OAuth failed: {}", e), Color::Red);
-                    }
                     Err(e) => {
-                        app.set_msg(format!("Error: {}", e), Color::Red);
+                        app.set_msg(format!("OAuth failed: {}", e), Color::Red);
                     }
                 }
 
@@ -1459,6 +1542,172 @@ async fn handle_accounts_menu(
     }
     Ok(())
 }
+
+
+/// Pins the accounts.json schema for the clipboard import/export format:
+/// `{"version": 1, "accounts": [...]}`
+async fn execute_clipboard_import(
+    store: &mut FileStore,
+    json_text: &str,
+) -> Result<ImportResult, AgySwitchError> {
+    // Count current accounts + incoming accounts; enforce 150-account hard limit
+    let parsed: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|e| AgySwitchError::OAuthFailed(format!("JSON parse: {}", e)))?;
+    let accounts_arr = parsed
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut errors = Vec::new();
+    let mut imported = 0u32;
+    let mut updated = 0u32;
+    let mut skipped = 0u32;
+
+    for (i, acct) in accounts_arr.iter().enumerate() {
+        // Enforce hard limit per-account (so we don't import past 150 total)
+        if store.count() >= MAX_ACCOUNTS {
+            errors.push(format!("Stopped at {} accounts (limit)", MAX_ACCOUNTS));
+            skipped += (accounts_arr.len() - i) as u32;
+            break;
+        }
+
+        let email = acct.get("email").and_then(|v| v.as_str()).unwrap_or("");
+        let access_token = acct.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
+        let refresh_token = acct.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("");
+
+        if email.is_empty() || refresh_token.is_empty() {
+            errors.push(format!("Account {} missing email/refresh_token", i + 1));
+            skipped += 1;
+            continue;
+        }
+
+        let label = acct.get("label").and_then(|v| v.as_str()).map(String::from);
+        let project_id = acct.get("project_id").and_then(|v| v.as_str()).map(String::from);
+        let expiry_str = acct.get("expiry").and_then(|v| v.as_str()).unwrap_or("");
+        let expiry = chrono::DateTime::parse_from_rfc3339(expiry_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now() + chrono::Duration::hours(1));
+
+        // Update existing by email, else add new
+        if let Some(existing) = store.get_by_email(email).cloned() {
+            let mut updated_account = existing;
+            updated_account.credential.access_token = access_token.to_string();
+            updated_account.credential.refresh_token = refresh_token.to_string();
+            updated_account.credential.expiry = expiry;
+            updated_account.credential.project_id = project_id.or(updated_account.credential.project_id);
+            if let Some(l) = label.clone() {
+                updated_account.label = Some(l);
+            }
+            if let Err(e) = store.update(updated_account).await {
+                errors.push(format!("{} update failed: {}", email, e));
+            } else {
+                updated += 1;
+            }
+        } else {
+            let credential = crate::store::account::OAuthCredential {
+                access_token: access_token.to_string(),
+                refresh_token: refresh_token.to_string(),
+                project_id,
+                managed_project_id: None,
+                expiry,
+            };
+            let account = crate::store::account::Account {
+                id: uuid::Uuid::new_v4(),
+                email: email.to_string(),
+                label,
+                credential,
+                quota: None,
+                added_at: chrono::Utc::now(),
+                last_used_at: None,
+                is_rate_limited: false,
+                rate_limit_reset_at: None,
+                enabled: true,
+            };
+            if let Err(e) = store.add(account).await {
+                match e {
+                    AgySwitchError::DuplicateAccount(_) => {
+                        skipped += 1;
+                    }
+                    other => {
+                        errors.push(format!("Add failed: {}", other));
+                    }
+                }
+            } else {
+                imported += 1;
+            }
+        }
+    }
+
+    store.flush().await?;
+    Ok(ImportResult { imported, updated, skipped, errors })
+}
+
+/// Paste-confirm screen handler: scroll \u{2191}\u{2193}, Enter imports, Esc cancels.
+async fn handle_paste_confirm(
+    key: KeyEvent,
+    app: &mut App,
+    store: &mut FileStore,
+) -> Result<(), AgySwitchError> {
+    let line_count = app.paste_json_buffer.lines().count();
+    match key.code {
+        KeyCode::Esc => {
+            app.paste_json_buffer.clear();
+            app.paste_scroll = 0;
+            app.screen = Screen::AccountsMenu;
+            app.menu_idx = 2;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.paste_scroll > 0 {
+                app.paste_scroll -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.paste_scroll + 1 < line_count {
+                app.paste_scroll += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.paste_scroll = app.paste_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            app.paste_scroll = (app.paste_scroll + 10).min(line_count.saturating_sub(1));
+        }
+        KeyCode::Home => {
+            app.paste_scroll = 0;
+        }
+        KeyCode::End => {
+            app.paste_scroll = line_count.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            // Confirm import — parse JSON, add accounts to store (with 150 limit), clear buffer
+            let text = std::mem::take(&mut app.paste_json_buffer);
+            app.set_msg("Importing from clipboard...", Color::Yellow);
+            match execute_clipboard_import(store, &text).await {
+                Ok(r) => {
+                    if r.errors.is_empty() {
+                        app.set_msg(format!("Imported: {}", r.summary()), Color::Green);
+                        app.set_toast(format!("Imported: {}", r.summary()));
+                    } else {
+                        app.set_msg(
+                            format!("Imported: {} | Errors: {}", r.summary(), r.errors[0]),
+                            Color::Yellow,
+                        );
+                    }
+                }
+                Err(e) => {
+                    app.set_msg(format!("Import failed: {}", e), Color::Red);
+                }
+            }
+            app.paste_scroll = 0;
+            app.screen = Screen::MainMenu;
+            app.menu_idx = 1;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 
 async fn handle_text_input(
     key: KeyEvent,
@@ -1496,28 +1745,23 @@ async fn handle_text_input(
 
                     app.set_msg("Importing...".to_string(), Color::Yellow);
 
-                    let result = tokio::task::spawn_blocking(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| {
-                                AgySwitchError::OAuthFailed(format!("Runtime: {}", e))
-                            })?;
-                        rt.block_on(async {
-                            let mut s = FileStore::new(crate::config::accounts_path());
-                            s.load().await?;
-                            let r = crate::commands::account_add::handle_add_json(&mut s, path).await?;
-                            Ok::<crate::commands::account_add::ImportResult, AgySwitchError>(r)
-                        })
-                    })
-                    .await;
+                    // Reuse the existing runtime (no nested runtime). We're on the TUI event loop,
+                    // but we just `.await` directly — crossterm event::poll is not running concurrently.
+                    let path_owned = path.clone();
+                    let result: Result<ImportResult, AgySwitchError> = {
+                        let mut s = FileStore::new(crate::config::accounts_path());
+                        s.load().await?;
+                        crate::commands::account_add::handle_add_json(&mut s, path_owned).await
+                    };
+                    let _ = path; // path moved into closure above
 
                     store.load().await.unwrap_or(());
 
                     match result {
-                        Ok(Ok(r)) => {
+                        Ok(r) => {
                             if r.errors.is_empty() {
                                 app.set_msg(format!("Import: {}", r.summary()), Color::Green);
+                                app.set_toast(format!("Import: {}", r.summary()));
                             } else {
                                 app.set_msg(
                                     format!("Import: {} | Errors: {}", r.summary(), r.errors[0]),
@@ -1525,11 +1769,8 @@ async fn handle_text_input(
                                 );
                             }
                         }
-                        Ok(Err(e)) => {
-                            app.set_msg(format!("Import failed: {}", e), Color::Red);
-                        }
                         Err(e) => {
-                            app.set_msg(format!("Error: {}", e), Color::Red);
+                            app.set_msg(format!("Import failed: {}", e), Color::Red);
                         }
                     }
 

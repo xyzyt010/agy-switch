@@ -787,10 +787,8 @@ pub async fn fetch_all_quotas(
         }
     }
 
-    eprintln!(
-        "[AGY-SWITCH] Fetched quota for {}/{} accounts ({} rate limited)",
-        updated, total, rate_limited
-    );
+    // Logging disabled — these eprintln leak into the TUI alt screen on Windows.
+    let _ = (updated, total, rate_limited);
     Ok(updated)
 }
 
@@ -1028,7 +1026,7 @@ pub async fn import_from_official_tools(
         if let Err(e) = store.add(account).await {
             match e {
                 AgySwitchError::DuplicateAccount(_) => {}
-                _ => eprintln!("[AGY-SWITCH] Import error: {}", e),
+                _ => { /* silently skip */ }
             }
         } else {
             imported += 1;
@@ -1118,7 +1116,7 @@ pub async fn import_from_proxy_readonly(
         if let Err(e) = store.add(account).await {
             match e {
                 AgySwitchError::DuplicateAccount(_) => {}
-                _ => eprintln!("[AGY-SWITCH] Proxy import error: {}", e),
+                _ => { /* silently skip */ }
             }
         } else {
             imported += 1;
