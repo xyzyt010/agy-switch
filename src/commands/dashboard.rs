@@ -1451,6 +1451,7 @@ async fn handle_accounts_menu(
                 }
                 app.paste_json_buffer = text;
                 app.paste_scroll = 0;
+                app.set_toast(format!("Read {} bytes from clipboard", app.paste_json_buffer.len()));
                 app.screen = Screen::PasteConfirm;
             }
             3 => {
