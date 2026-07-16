@@ -5,6 +5,18 @@ use crate::error::AgySwitchError;
 use crate::quota::models::{ModelQuota, QuotaSnapshot};
 use crate::store::account::OAuthCredential;
 
+/// Platform-specific User-Agent string
+fn platform_user_agent() -> &'static str {
+    #[cfg(target_os = "windows")]
+    { "antigravity/1.0 windows/amd64" }
+    #[cfg(target_os = "linux")]
+    { "antigravity/1.0 linux/amd64" }
+    #[cfg(target_os = "macos")]
+    { "antigravity/1.0 darwin/arm64" }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    { "antigravity/1.0" }
+}
+
 /// Cloud Code API endpoints (fallback order: daily → prod)
 const ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
@@ -73,9 +85,8 @@ async fn fetch_available_models(
             .post(&url)
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
-            .header("User-Agent", "antigravity/1.0 windows/amd64")
+            .header("User-Agent", platform_user_agent())
             .header("X-Client-Name", "antigravity")
-            .header("x-goog-api-client", "gl-node/18.18.2 fire/0.8.6 grpc/1.10.x")
             .body(body.clone())
             .send()
             .await
@@ -91,7 +102,7 @@ async fn fetch_available_models(
         }
 
         let text = resp.text().await.unwrap_or_default();
-        let _ = (endpoint, status, &text); // suppressed — was leaking into TUI
+        let _ = (endpoint, status, &text);
         return Err(AgySwitchError::OAuthFailed(format!("fetchAvailableModels {}: {}", status, &text[..text.len().min(200)])));
     }
 
@@ -119,7 +130,7 @@ async fn retrieve_user_quota(
             .post(&url)
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
-            .header("User-Agent", "antigravity/1.0 windows/amd64")
+            .header("User-Agent", platform_user_agent())
             .body(body.clone())
             .send()
             .await
@@ -137,7 +148,7 @@ async fn retrieve_user_quota(
         }
 
         let text = resp.text().await.unwrap_or_default();
-        let _ = (endpoint, status, &text); // suppressed
+        let _ = (endpoint, status, &text);
         return Err(AgySwitchError::OAuthFailed(format!("retrieveUserQuota {}: {}", status, &text[..text.len().min(200)])));
     }
 
@@ -159,7 +170,7 @@ async fn load_code_assist(
             .post(&url)
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
-            .header("User-Agent", "antigravity/1.0 windows/amd64")
+            .header("User-Agent", platform_user_agent())
             .body(body)
             .send()
             .await
@@ -177,7 +188,7 @@ async fn load_code_assist(
         }
 
         let text = resp.text().await.unwrap_or_default();
-        let _ = (endpoint, status, &text); // suppressed
+        let _ = (endpoint, status, &text);
         return Err(AgySwitchError::OAuthFailed(format!("loadCodeAssist {}: {}", status, &text[..text.len().min(200)])));
     }
 

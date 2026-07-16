@@ -37,6 +37,10 @@ pub async fn write_active_account(account: &Account) -> Result<crate::store::acc
     // Step 6: Write to Windows Credential Manager (THE actual agy CLI auth source)
     let _ = write_to_windows_credential_manager(account, &fresh_credential).await;
 
+    // Step 7: Write to Linux Secret Service / file-based keyring
+    #[cfg(target_os = "linux")]
+    let _ = write_to_linux_keyring(account, &fresh_credential).await;
+
     Ok(fresh_credential)
 }
 
@@ -267,20 +271,32 @@ async fn write_claude_settings(
 }
 
 /// Get the path to Antigravity's state.vscdb
+/// Platform-specific paths:
+/// - Windows: %APPDATA%/Antigravity/User/globalStorage/state.vscdb
+/// - Linux: ~/.local/share/Antigravity/User/globalStorage/state.vscdb
+/// - macOS: ~/Library/Application Support/Antigravity/User/globalStorage/state.vscdb
 fn antigravity_state_db() -> Result<PathBuf, AgySwitchError> {
-    let app_data = dirs::data_dir()
-        .or_else(dirs::home_dir)
-        .ok_or_else(|| {
-            AgySwitchError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "AppData directory not found",
-            ))
-        })?;
-    let db_path = app_data
-        .join("Antigravity")
-        .join("User")
-        .join("globalStorage")
-        .join("state.vscdb");
+    let home = dirs::home_dir().ok_or_else(|| {
+        AgySwitchError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Home directory not found",
+        ))
+    })?;
+
+    #[cfg(target_os = "windows")]
+    let db_path = {
+        let app_data = dirs::data_dir().unwrap_or_else(|| home.clone());
+        app_data.join("Antigravity").join("User").join("globalStorage").join("state.vscdb")
+    };
+
+    #[cfg(target_os = "linux")]
+    let db_path = home.join(".local").join("share").join("Antigravity").join("User").join("globalStorage").join("state.vscdb");
+
+    #[cfg(target_os = "macos")]
+    let db_path = home.join("Library").join("Application Support").join("Antigravity").join("User").join("globalStorage").join("state.vscdb");
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    let db_path = home.join(".local").join("share").join("Antigravity").join("User").join("globalStorage").join("state.vscdb");
 
     if !db_path.exists() {
         return Err(AgySwitchError::Io(std::io::Error::new(
@@ -319,13 +335,14 @@ db.close()
         ))
     })?;
 
-    let output = std::process::Command::new("python")
+    let output = std::process::Command::new("python3")
         .arg(&script_path)
         .output()
+        .or_else(|_| std::process::Command::new("python").arg(&script_path).output())
         .map_err(|e| {
             AgySwitchError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to run python: {}", e),
+                format!("Failed to run python (tried python3, python): {}", e),
             ))
         })?;
 
@@ -542,13 +559,14 @@ else:
         ))
     })?;
 
-    let output = std::process::Command::new("python")
+    let output = std::process::Command::new("python3")
         .arg(&script_path)
         .output()
+        .or_else(|_| std::process::Command::new("python").arg(&script_path).output())
         .map_err(|e| {
             AgySwitchError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to run python: {}", e),
+                format!("Failed to run python (tried python3, python): {}", e),
             ))
         })?;
 
@@ -575,6 +593,78 @@ async fn write_to_windows_credential_manager(
     _account: &Account,
     _credential: &crate::store::account::OAuthCredential,
 ) -> Result<(), AgySwitchError> {
+    // No-op on non-Windows platforms (Linux uses file-based auth via ~/.antigravity_tools/)
+    Ok(())
+}
+
+/// Write to Linux Secret Service (GNOME Keyring / KDE Wallet) via D-Bus.
+/// This is what the `agy` CLI reads on Linux to get the active token.
+#[cfg(target_os = "linux")]
+async fn write_to_linux_keyring(
+    account: &Account,
+    credential: &crate::store::account::OAuthCredential,
+) -> Result<(), AgySwitchError> {
+    let (real_token, _, _) = crate::auth::token_refresh::parse_composite_token(&credential.refresh_token);
+
+    let blob_data = serde_json::json!({
+        "token": {
+            "access_token": credential.access_token,
+            "token_type": "Bearer",
+            "refresh_token": real_token,
+            "expiry": credential.expiry.to_rfc3339(),
+        },
+        "auth_method": "consumer",
+    });
+
+    let blob_json = serde_json::to_string(&blob_data).map_err(AgySwitchError::Json)?;
+
+    // Try secret-service crate, fall back to file-based storage
+    #[cfg(feature = "linux-keyring")]
+    {
+        if let Ok(cs) = secret_service::SecretService::new(secret_service::EncryptionType::Dh) {
+            if let Ok(collection) = cs.get_default_collection() {
+                // Delete existing entry if any
+                let _ = collection.search_items(std::collections::HashMap::from([("service", "gemini"), ("account", "antigravity")]))
+                    .and_then(|items| items.first().ok().cloned())
+                    .and_then(|item| item.delete().ok());
+
+                let _ = collection.create_item(
+                    "AGY-SWITCH: antigravity",
+                    std::collections::HashMap::from([
+                        ("service", "gemini"),
+                        ("account", "antigravity"),
+                        ("username", account.email.as_str()),
+                    ]),
+                    blob_json.as_bytes(),
+                    true, // replace existing
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // Fallback: write to ~/.config/antigravity/keyring.json (file-based keyring)
+    let home = dirs::home_dir().ok_or_else(|| {
+        AgySwitchError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Home directory not found",
+        ))
+    })?;
+
+    let keyring_dir = home.join(".config").join("antigravity");
+    let _ = tokio::fs::create_dir_all(&keyring_dir).await;
+    let keyring_path = keyring_dir.join("keyring.json");
+
+    let keyring_data = serde_json::json!({
+        "service": "gemini",
+        "account": "antigravity",
+        "email": account.email,
+        "token": blob_json,
+    });
+
+    let keyring_json = serde_json::to_string_pretty(&keyring_data).map_err(AgySwitchError::Json)?;
+    tokio::fs::write(&keyring_path, keyring_json).await.map_err(AgySwitchError::Io)?;
+
     Ok(())
 }
 

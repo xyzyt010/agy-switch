@@ -11,9 +11,6 @@ repository = "https://github.com/xyzyt010/agy-switch"
 name = "agy-switch"
 path = "src/main.rs"
 
-[features]
-default = ["arboard"]
-
 [dependencies]
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "string"] }
@@ -66,6 +63,14 @@ urlencoding = "2.1"
 # Unix process management
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 libc = "0.2"
+
+# Linux Secret Service (keyring) for credential storage
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "3", optional = true }
+
+[features]
+default = ["arboard"]
+linux-keyring = ["secret-service"]
 
 [profile.release]
 opt-level = 3
