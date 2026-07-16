@@ -1421,16 +1421,10 @@ async fn handle_accounts_menu(
                     app.set_msg(format!("Limit reached ({}). Remove accounts first.", MAX_ACCOUNTS), Color::Red);
                     return Ok(());
                 }
-                let text = match arboard::Clipboard::new() {
-                    Ok(mut cb) => match cb.get_text() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            app.set_msg(format!("Clipboard read failed: {}", e), Color::Red);
-                            return Ok(());
-                        }
-                    },
+                let text = match crate::clipboard::get_text() {
+                    Ok(t) => t,
                     Err(e) => {
-                        app.set_msg(format!("Clipboard unavailable: {}", e), Color::Red);
+                        app.set_msg(format!("Clipboard: {}", e), Color::Red);
                         return Ok(());
                     }
                 };
@@ -1495,17 +1489,12 @@ async fn handle_accounts_menu(
                         return Ok(());
                     }
                 };
-                match arboard::Clipboard::new() {
-                    Ok(mut cb) => match cb.set_text(&json) {
-                        Ok(()) => {
-                            app.set_toast(format!("Copied {} accounts to clipboard", accounts.len()));
-                        }
-                        Err(e) => {
-                            app.set_msg(format!("Clipboard write failed: {}", e), Color::Red);
-                        }
-                    },
+                match crate::clipboard::set_text(&json) {
+                    Ok(()) => {
+                        app.set_toast(format!("Copied {} accounts to clipboard", accounts.len()));
+                    }
                     Err(e) => {
-                        app.set_msg(format!("Clipboard unavailable: {}", e), Color::Red);
+                        app.set_msg(format!("Clipboard: {}", e), Color::Red);
                     }
                 }
             }

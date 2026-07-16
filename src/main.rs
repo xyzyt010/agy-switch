@@ -1,4 +1,5 @@
 mod auth;
+mod clipboard;
 mod cli;
 mod commands;
 mod config;
