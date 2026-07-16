@@ -26,6 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target x86_64-unknown-linux-musl --bin agy-switch
       - uses: actions/upload-artifact@v4
         with:
@@ -40,7 +41,7 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
       - run: |
-          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
       - run: cargo build --release --target aarch64-unknown-linux-musl --bin agy-switch
       - uses: actions/upload-artifact@v4
