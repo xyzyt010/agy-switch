@@ -938,6 +938,13 @@ fn draw_detail_pane(
         )));
     }
 
+    // Show remove hint at bottom of detail pane
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press r to remove this account",
+        Style::default().fg(Color::Yellow),
+    )));
+
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
@@ -1143,9 +1150,9 @@ fn draw_status_bar(
         Screen::MainMenu => " \u{2191}\u{2193} Navigate   Enter Select   q Quit ",
         Screen::SwitchAccounts => {
             if app.mode == SwitchMode::Manual {
-                " \u{2191}\u{2193} Navigate   Enter Switch   x Remove   Esc Back "
+                " \u{2191}\u{2193} Navigate   Enter Switch   r Remove   Esc Back "
             } else {
-                " \u{2191}\u{2193} Navigate   Enter Actions   x Remove   Esc Back "
+                " \u{2191}\u{2193} Navigate   Enter Actions   r Remove   Esc Back "
             }
         }
         Screen::ContextMenu => " \u{2191}\u{2193} Navigate   Enter Select   Esc Back ",
@@ -1331,7 +1338,7 @@ async fn handle_switch_accounts(
                 }
             }
         }
-        KeyCode::Char('x') | KeyCode::Delete => {
+        KeyCode::Char('x') | KeyCode::Delete | KeyCode::Char('r') => {
             if count > 0 && app.list_idx < count {
                 if let Some(a) = store.list_sorted().get(app.list_idx).cloned() {
                     let email = a.email.clone();
@@ -1359,7 +1366,7 @@ async fn handle_switch_accounts(
                 }
             }
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
+        KeyCode::Char('R') => {
             app.set_msg("Refreshing quota...".to_string(), Color::Yellow);
             match crate::store::active_writer::fetch_all_quotas(store).await {
                 Ok(n) => {

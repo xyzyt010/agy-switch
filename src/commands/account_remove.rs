@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use uuid::Uuid;
 
 use crate::error::AgySwitchError;
@@ -6,22 +5,15 @@ use crate::store::file_store::FileStore;
 
 pub async fn handle_remove(store: &mut FileStore, target: Option<String>, all: bool) -> Result<(), AgySwitchError> {
     if all {
-        print!("[AGY-SWITCH] ⚠️  This will remove ALL accounts. Type 'DELETE ALL' to confirm: ");
-        io::stdout().flush().map_err(AgySwitchError::Io)?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).map_err(AgySwitchError::Io)?;
-        if input.trim() != "DELETE ALL" {
-            println!("[AGY-SWITCH] Cancelled.");
-            return Ok(());
+        // Remove from official files too
+        for account in store.list().iter() {
+            let _ = remove_from_official_files(&account.email).await;
         }
-        let count = store.count();
         store.remove_all().await?;
-        println!("[AGY-SWITCH] ✅ Removed all {} accounts.", count);
         return Ok(());
     }
 
     let target = target.ok_or_else(|| {
-        eprintln!("[AGY-SWITCH] Error: No account specified. Use --all to remove all.");
         AgySwitchError::AccountNotFound("no target".to_string())
     })?;
 
@@ -40,8 +32,69 @@ pub async fn handle_remove(store: &mut FileStore, target: Option<String>, all: b
     let account = store.get(id)
         .ok_or_else(|| AgySwitchError::AccountNotFound(target.clone()))?
         .clone();
+
+    // Remove from official files first
+    let _ = remove_from_official_files(&account.email).await;
+
     store.remove(id).await?;
-    println!("[AGY-SWITCH] ✅ Removed account: {}", account.email);
+
+    Ok(())
+}
+
+/// Remove an account from the official ~/.antigravity_tools/ accounts.json and delete its individual file.
+/// Best-effort — errors are logged but don't fail the removal.
+async fn remove_from_official_files(email: &str) -> Result<(), AgySwitchError> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        AgySwitchError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Home directory not found",
+        ))
+    })?;
+
+    let tools_dir = home.join(".antigravity_tools");
+    let accounts_json_path = tools_dir.join("accounts.json");
+
+    if !tokio::fs::try_exists(&accounts_json_path).await.unwrap_or(false) {
+        return Ok(());
+    }
+
+    let contents = tokio::fs::read_to_string(&accounts_json_path)
+        .await
+        .map_err(AgySwitchError::Io)?;
+    let mut index: serde_json::Value =
+        serde_json::from_str(&contents).map_err(AgySwitchError::Json)?;
+
+    let accounts_arr = match index.get_mut("accounts").and_then(|v| v.as_array_mut()) {
+        Some(arr) => arr,
+        None => return Ok(()),
+    };
+
+    // Find the matching account
+    let mut found_id: Option<String> = None;
+    let mut found_idx: Option<usize> = None;
+    for (i, entry) in accounts_arr.iter().enumerate() {
+        if let Some(entry_email) = entry.get("email").and_then(|v| v.as_str()) {
+            if entry_email.eq_ignore_ascii_case(email) {
+                found_id = entry.get("id").and_then(|v| v.as_str()).map(String::from);
+                found_idx = Some(i);
+                break;
+            }
+        }
+    }
+
+    if let Some(idx) = found_idx {
+        accounts_arr.remove(idx);
+
+        // Write updated index back
+        let index_json = serde_json::to_string_pretty(&index).map_err(AgySwitchError::Json)?;
+        let _ = tokio::fs::write(&accounts_json_path, index_json).await;
+    }
+
+    // Delete the individual account file
+    if let Some(id_str) = found_id {
+        let individual_path = tools_dir.join("accounts").join(format!("{}.json", id_str));
+        let _ = tokio::fs::remove_file(&individual_path).await;
+    }
 
     Ok(())
 }
