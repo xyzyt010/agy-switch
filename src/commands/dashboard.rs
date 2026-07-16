@@ -387,6 +387,10 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, store: &FileStore, state: &Ap
                 .bg(onoff_color)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            "                  \u{2190} Esc Go back",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
 
     let line2 = Line::from(vec![
