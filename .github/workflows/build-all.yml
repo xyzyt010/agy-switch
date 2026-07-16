@@ -19,6 +19,19 @@ jobs:
           name: agy-switch-windows-x64.exe
           path: target/x86_64-pc-windows-msvc/release/agy-switch.exe
 
+  build-windows-arm64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - run: cargo build --release --target aarch64-pc-windows-msvc --bin agy-switch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agy-switch-windows-arm64.exe
+          path: target/aarch64-pc-windows-msvc/release/agy-switch.exe
+
   build-linux-x64:
     runs-on: ubuntu-latest
     steps:

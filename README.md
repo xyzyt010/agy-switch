@@ -13,7 +13,7 @@ Antigravity account quota monitor, auto-switcher, and TUI dashboard.
 - **Clipboard import/export** — paste accounts JSON for quick review before importing
 - **Remove account** — remove accounts directly from the TUI
 - **OAuth login** — login via browser-based OAuth flow
-- **Cross-platform** — Windows x64, Linux x64, Linux ARM64, macOS ARM64
+- **Cross-platform** — Windows x64, Windows ARM64, Linux x64, Linux ARM64, macOS ARM64
 
 ## Install
 
@@ -24,6 +24,9 @@ Download the latest binary for your platform from [Releases](https://github.com/
 ```powershell
 # x64 (Intel/AMD)
 iwr -Uri "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-windows-x64.exe" -OutFile "$env:LOCALAPPDATA\agy\bin\agy-switch.exe"
+
+# ARM64 (Surface Pro X, Snapdragon, etc.)
+iwr -Uri "https://github.com/xyzyt010/agy-switch/releases/latest/download/agy-switch-windows-arm64.exe" -OutFile "$env:LOCALAPPDATA\agy\bin\agy-switch.exe"
 
 # Add to PATH (run once)
 $currentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
@@ -78,6 +81,7 @@ cargo build --release
 | Platform | Binary | Notes |
 |---|---|---|
 | Windows x64 | `agy-switch-windows-x64.exe` | Native MSVC build |
+| Windows ARM64 | `agy-switch-windows-arm64.exe` | Surface Pro X, Snapdragon |
 | Linux x64 | `agy-switch-linux-x64` | Static musl binary, no dependencies |
 | Linux ARM64 | `agy-switch-linux-arm64` | Static musl binary, no dependencies |
 | macOS ARM64 | `agy-switch-macos-arm64` | Apple Silicon (M1/M2/M3/M4) |
