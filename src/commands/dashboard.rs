@@ -213,11 +213,11 @@ async fn run_loop(
 
         // In PasteConfirm input mode, buffer rapid keystrokes (terminal paste)
         // to avoid crashing the TUI with thousands of individual renders.
+        // Only exits after 80ms of silence (paste burst is over).
         if app.screen == Screen::PasteConfirm && app.paste_json_buffer.is_empty() {
             let mut input_buf = String::new();
-            let mut done = false;
             let mut escape = false;
-            // Collect all events arriving within 80ms (paste burst)
+            // Keep reading events as long as they arrive within 80ms of each other
             loop {
                 if crossterm::event::poll(std::time::Duration::from_millis(80)).map_err(io_err)? {
                     match crossterm::event::read().map_err(io_err)? {
@@ -225,16 +225,13 @@ async fn run_loop(
                             match k.code {
                                 KeyCode::Esc => {
                                     escape = true;
-                                    done = true;
                                     break;
                                 }
-                                KeyCode::Enter if !input_buf.is_empty() => {
-                                    done = true;
-                                    break;
-                                }
-                                KeyCode::Enter => {}
                                 KeyCode::Char(c) => {
                                     input_buf.push(c);
+                                }
+                                KeyCode::Enter => {
+                                    input_buf.push('\n');
                                 }
                                 KeyCode::Backspace => {
                                     input_buf.pop();
@@ -245,7 +242,7 @@ async fn run_loop(
                         _ => {}
                     }
                 } else {
-                    break;
+                    break; // 80ms of silence — paste is done
                 }
             }
             if escape {
@@ -255,17 +252,12 @@ async fn run_loop(
                 app.menu_idx = 2;
                 continue;
             }
-            if done && !input_buf.is_empty() {
-                app.paste_json_buffer = input_buf;
-                app.paste_scroll = 0;
-                continue;
-            }
             if !input_buf.is_empty() {
                 app.paste_json_buffer = input_buf;
                 app.paste_scroll = 0;
-                continue;
+                continue; // Re-render with buffered paste
             }
-            // No paste activity — fall through to normal 1s poll below
+            // No paste activity — fall through to normal 1s poll
         }
 
         let key = loop {
