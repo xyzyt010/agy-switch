@@ -740,21 +740,15 @@ fn draw_toast(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
-/// Paste-confirm screen: shows JSON from clipboard or accepts direct text input.
+/// Paste-confirm screen: shows JSON from clipboard for review before importing.
 fn draw_paste_confirm(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(3)])
         .split(area);
 
-    let is_input_mode = app.paste_json_buffer.is_empty();
-
     let header = Paragraph::new(Line::from(Span::styled(
-        if is_input_mode {
-            " Paste JSON below, then Ctrl+Enter to import "
-        } else {
-            "  \u{2191}\u{2193} Scroll   Enter Import   Esc Cancel "
-        },
+        "  \u{2191}\u{2193} Scroll   Enter Import   Esc Cancel",
         Style::default().fg(Color::Yellow),
     )))
     .block(
@@ -765,75 +759,36 @@ fn draw_paste_confirm(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
     f.render_widget(header, chunks[0]);
 
-    if is_input_mode {
-        let content = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Paste your accounts JSON here (Ctrl+Shift+V or right-click)",
+    let lines: Vec<Line> = app
+        .paste_json_buffer
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))))
+        .collect();
+
+    let visible_h = (chunks[1].height as usize).saturating_sub(2);
+    let total = lines.len();
+    let start = app.paste_scroll.min(total.saturating_sub(1));
+    let end = (start + visible_h).min(total);
+    let slice: Vec<Line> = lines.into_iter().skip(start).take(end - start).collect();
+
+    let content = Paragraph::new(slice).block(
+        Block::default()
+            .title(Span::styled(
+                format!(" JSON (lines {}-{} of {}) ", start + 1, end, total),
                 Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  > ", Style::default().fg(Color::Green)),
-                Span::styled(
-                    "_",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ),
-            ]),
-        ])
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    " Awaiting input... ",
-                    Style::default().fg(Color::Green),
-                ))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-        f.render_widget(content, chunks[1]);
-    } else {
-        let lines: Vec<Line> = app
-            .paste_json_buffer
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))))
-            .collect();
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(content, chunks[1]);
 
-        let visible_h = (chunks[1].height as usize).saturating_sub(2);
-        let total = lines.len();
-        let start = app.paste_scroll.min(total.saturating_sub(1));
-        let end = (start + visible_h).min(total);
-        let slice: Vec<Line> = lines.into_iter().skip(start).take(end - start).collect();
-
-        let content = Paragraph::new(slice).block(
-            Block::default()
-                .title(Span::styled(
-                    format!(" JSON (lines {}-{} of {}) ", start + 1, end, total),
-                    Style::default().fg(Color::DarkGray),
-                ))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-        f.render_widget(content, chunks[1]);
-    }
-
-    let status = if is_input_mode {
-        Paragraph::new(Line::from(Span::styled(
-            " Paste JSON   Ctrl+Enter Import   Esc Cancel ",
-            Style::default().fg(Color::DarkGray),
-        )))
-    } else {
-        let line_count = app.paste_json_buffer.lines().count();
-        let _start = app.paste_scroll.min(line_count.saturating_sub(1));
-        Paragraph::new(Line::from(Span::styled(
-            format!(
-                " Lines: {}   \u{2191}\u{2193} Scroll   Enter Import   Esc Back ",
-                line_count
-            ),
-            Style::default().fg(Color::DarkGray),
-        )))
-    };
+    let status = Paragraph::new(Line::from(Span::styled(
+        format!(
+            " Lines: {}   \u{2191}\u{2193} Scroll   Enter Import   Esc Back ",
+            total
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
     f.render_widget(status, chunks[2]);
 }
 
@@ -1480,10 +1435,11 @@ async fn handle_accounts_menu(
                         app.screen = Screen::PasteConfirm;
                     }
                     _ => {
-                        // Clipboard unavailable or empty — let user paste/type JSON directly
-                        app.paste_json_buffer.clear();
-                        app.paste_scroll = 0;
-                        app.screen = Screen::PasteConfirm;
+                        // Clipboard unavailable — redirect to file import
+                        app.set_msg("Clipboard empty. Use Import from JSON file instead.", Color::Yellow);
+                        app.text_input.clear();
+                        app.text_input_purpose = Some(TextInputPurpose::ImportJson);
+                        app.screen = Screen::TextInput;
                     }
                 }
             }
@@ -1678,8 +1634,6 @@ async fn execute_clipboard_import(
 }
 
 /// Paste-confirm screen handler: scroll ↑↓, Enter imports, Esc cancels.
-/// When buffer is empty, accepts typed/pasted text input — Enter adds newline,
-/// Ctrl+Enter or F5 confirms import.
 async fn handle_paste_confirm(
     key: KeyEvent,
     app: &mut App,
@@ -1693,10 +1647,7 @@ async fn handle_paste_confirm(
             app.screen = Screen::AccountsMenu;
             app.menu_idx = 2;
         }
-        // Ctrl+Enter or F5: confirm import (works in both input and review mode)
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL)
-            || key.code == KeyCode::F(5) =>
-        {
+        KeyCode::Enter => {
             if app.paste_json_buffer.is_empty() {
                 return Ok(());
             }
@@ -1722,48 +1673,12 @@ async fn handle_paste_confirm(
             app.screen = Screen::MainMenu;
             app.menu_idx = 1;
         }
-        // Plain Enter in review mode (buffer non-empty): confirm import
-        KeyCode::Enter if !app.paste_json_buffer.is_empty() => {
-            let text = std::mem::take(&mut app.paste_json_buffer);
-            app.set_msg("Importing...", Color::Yellow);
-            match execute_clipboard_import(store, &text).await {
-                Ok(r) => {
-                    if r.errors.is_empty() {
-                        app.set_msg(format!("Imported: {}", r.summary()), Color::Green);
-                        app.set_toast(format!("Imported: {}", r.summary()));
-                    } else {
-                        app.set_msg(
-                            format!("Imported: {} | Errors: {}", r.summary(), r.errors[0]),
-                            Color::Yellow,
-                        );
-                    }
-                }
-                Err(e) => {
-                    app.set_msg(format!("Import failed: {}", e), Color::Red);
-                }
-            }
-            app.paste_scroll = 0;
-            app.screen = Screen::MainMenu;
-            app.menu_idx = 1;
-        }
-        // Plain Enter in input mode: add newline to buffer
-        KeyCode::Enter => {
-            app.paste_json_buffer.push('\n');
-        }
-        // Text input: any character gets appended to buffer (paste via terminal)
-        KeyCode::Char(c) => {
-            app.paste_json_buffer.push(c);
-        }
-        KeyCode::Backspace => {
-            app.paste_json_buffer.pop();
-        }
-        // Scroll when buffer has content
-        KeyCode::Up | KeyCode::Char('k') if !app.paste_json_buffer.is_empty() => {
+        KeyCode::Up | KeyCode::Char('k') => {
             if app.paste_scroll > 0 {
                 app.paste_scroll -= 1;
             }
         }
-        KeyCode::Down | KeyCode::Char('j') if !app.paste_json_buffer.is_empty() => {
+        KeyCode::Down | KeyCode::Char('j') => {
             if app.paste_scroll + 1 < line_count {
                 app.paste_scroll += 1;
             }
