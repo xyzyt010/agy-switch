@@ -213,10 +213,11 @@ async fn run_loop(
 
         let key = loop {
             if crossterm::event::poll(std::time::Duration::from_secs(1)).map_err(io_err)? {
-                if let Event::Key(k) = crossterm::event::read().map_err(io_err)? {
-                    if k.kind == KeyEventKind::Press {
+                match crossterm::event::read().map_err(io_err)? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
                         break Some(k);
                     }
+                    _ => {}
                 }
             }
 
@@ -739,25 +740,23 @@ fn draw_toast(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
-/// Scrollable text box showing clipboard JSON. Enter = confirm import, Esc = cancel.
+/// Paste-confirm screen: shows JSON from clipboard or accepts direct text input.
 fn draw_paste_confirm(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    // Layout: instructions (3) + scrollable JSON (fill) + status (1)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(4), Constraint::Length(1)])
+        .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(3)])
         .split(area);
 
-    let header = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Clipboard contents:",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "  \u{2191}\u{2193} Scroll   Enter Confirm Import   Esc Cancel",
-            Style::default().fg(Color::Yellow),
-        )),
-    ])
+    let is_input_mode = app.paste_json_buffer.is_empty();
+
+    let header = Paragraph::new(Line::from(Span::styled(
+        if is_input_mode {
+            " Paste JSON below, then Ctrl+Enter to import "
+        } else {
+            "  \u{2191}\u{2193} Scroll   Enter Import   Esc Cancel "
+        },
+        Style::default().fg(Color::Yellow),
+    )))
     .block(
         Block::default()
             .title(" Paste Accounts JSON ")
@@ -766,40 +765,75 @@ fn draw_paste_confirm(f: &mut ratatui::Frame, area: Rect, app: &App) {
     );
     f.render_widget(header, chunks[0]);
 
-    let lines: Vec<Line> = app
-        .paste_json_buffer
-        .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))))
-        .collect();
-
-    let visible_h = (chunks[1].height as usize).saturating_sub(2);
-    let total = lines.len();
-    if app.paste_scroll > total.saturating_sub(1) && total > 0 {
-        // (read-only clone; can't mutate app here)
-    }
-    let start = app.paste_scroll.min(total.saturating_sub(1));
-    let end = (start + visible_h).min(total);
-    let slice: Vec<Line> = lines.into_iter().skip(start).take(end - start).collect();
-
-    let content = Paragraph::new(slice).block(
-        Block::default()
-            .title(Span::styled(
-                format!(" JSON (lines {}-{} of {}) ", start + 1, end, total),
+    if is_input_mode {
+        let content = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Paste your accounts JSON here (Ctrl+Shift+V or right-click)",
                 Style::default().fg(Color::DarkGray),
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    f.render_widget(content, chunks[1]);
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  > ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    "_",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ]),
+        ])
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " Awaiting input... ",
+                    Style::default().fg(Color::Green),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        f.render_widget(content, chunks[1]);
+    } else {
+        let lines: Vec<Line> = app
+            .paste_json_buffer
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::White))))
+            .collect();
 
-    let status = Paragraph::new(Line::from(Span::styled(
-        format!(
-            " Scroll: {} / {}   \u{2191}\u{2193} Continue scrolling   Enter Import   Esc Back ",
-            start + 1,
-            total
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
+        let visible_h = (chunks[1].height as usize).saturating_sub(2);
+        let total = lines.len();
+        let start = app.paste_scroll.min(total.saturating_sub(1));
+        let end = (start + visible_h).min(total);
+        let slice: Vec<Line> = lines.into_iter().skip(start).take(end - start).collect();
+
+        let content = Paragraph::new(slice).block(
+            Block::default()
+                .title(Span::styled(
+                    format!(" JSON (lines {}-{} of {}) ", start + 1, end, total),
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        f.render_widget(content, chunks[1]);
+    }
+
+    let status = if is_input_mode {
+        Paragraph::new(Line::from(Span::styled(
+            " Paste JSON   Ctrl+Enter Import   Esc Cancel ",
+            Style::default().fg(Color::DarkGray),
+        )))
+    } else {
+        let line_count = app.paste_json_buffer.lines().count();
+        let _start = app.paste_scroll.min(line_count.saturating_sub(1));
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                " Lines: {}   \u{2191}\u{2193} Scroll   Enter Import   Esc Back ",
+                line_count
+            ),
+            Style::default().fg(Color::DarkGray),
+        )))
+    };
     f.render_widget(status, chunks[2]);
 }
 
@@ -1421,38 +1455,37 @@ async fn handle_accounts_menu(
                     app.set_msg(format!("Limit reached ({}). Remove accounts first.", MAX_ACCOUNTS), Color::Red);
                     return Ok(());
                 }
-                let text = match crate::clipboard::get_text() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        app.set_msg(format!("Clipboard: {}", e), Color::Red);
-                        return Ok(());
+                match crate::clipboard::get_text() {
+                    Ok(text) if !text.trim().is_empty() => {
+                        // Try to parse as JSON before showing — if invalid, show error
+                        let parsed: serde_json::Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                app.set_msg(format!("Invalid JSON: {}", e), Color::Red);
+                                return Ok(());
+                            }
+                        };
+                        let accounts_arr = parsed
+                            .get("accounts")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if accounts_arr.is_empty() {
+                            app.set_msg("No accounts found in clipboard JSON", Color::Yellow);
+                            return Ok(());
+                        }
+                        app.paste_json_buffer = text;
+                        app.paste_scroll = 0;
+                        app.set_toast(format!("Read {} bytes from clipboard", app.paste_json_buffer.len()));
+                        app.screen = Screen::PasteConfirm;
                     }
-                };
-                if text.trim().is_empty() {
-                    app.set_msg("Clipboard is empty", Color::Yellow);
-                    return Ok(());
-                }
-                // Try to parse as JSON before showing — if invalid, show error
-                let parsed: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        app.set_msg(format!("Invalid JSON: {}", e), Color::Red);
-                        return Ok(());
+                    _ => {
+                        // Clipboard unavailable or empty — let user paste/type JSON directly
+                        app.paste_json_buffer.clear();
+                        app.paste_scroll = 0;
+                        app.screen = Screen::PasteConfirm;
                     }
-                };
-                let accounts_arr = parsed
-                    .get("accounts")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                if accounts_arr.is_empty() {
-                    app.set_msg("No accounts found in clipboard JSON", Color::Yellow);
-                    return Ok(());
                 }
-                app.paste_json_buffer = text;
-                app.paste_scroll = 0;
-                app.set_toast(format!("Read {} bytes from clipboard", app.paste_json_buffer.len()));
-                app.screen = Screen::PasteConfirm;
             }
             3 => {
                 // Copy accounts JSON to clipboard
@@ -1644,7 +1677,9 @@ async fn execute_clipboard_import(
     Ok(ImportResult { imported, updated, skipped, errors })
 }
 
-/// Paste-confirm screen handler: scroll \u{2191}\u{2193}, Enter imports, Esc cancels.
+/// Paste-confirm screen handler: scroll ↑↓, Enter imports, Esc cancels.
+/// When buffer is empty, accepts typed/pasted text input — Enter adds newline,
+/// Ctrl+Enter or F5 confirms import.
 async fn handle_paste_confirm(
     key: KeyEvent,
     app: &mut App,
@@ -1658,32 +1693,15 @@ async fn handle_paste_confirm(
             app.screen = Screen::AccountsMenu;
             app.menu_idx = 2;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.paste_scroll > 0 {
-                app.paste_scroll -= 1;
+        // Ctrl+Enter or F5: confirm import (works in both input and review mode)
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.code == KeyCode::F(5) =>
+        {
+            if app.paste_json_buffer.is_empty() {
+                return Ok(());
             }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.paste_scroll + 1 < line_count {
-                app.paste_scroll += 1;
-            }
-        }
-        KeyCode::PageUp => {
-            app.paste_scroll = app.paste_scroll.saturating_sub(10);
-        }
-        KeyCode::PageDown => {
-            app.paste_scroll = (app.paste_scroll + 10).min(line_count.saturating_sub(1));
-        }
-        KeyCode::Home => {
-            app.paste_scroll = 0;
-        }
-        KeyCode::End => {
-            app.paste_scroll = line_count.saturating_sub(1);
-        }
-        KeyCode::Enter => {
-            // Confirm import — parse JSON, add accounts to store (with 150 limit), clear buffer
             let text = std::mem::take(&mut app.paste_json_buffer);
-            app.set_msg("Importing from clipboard...", Color::Yellow);
+            app.set_msg("Importing...", Color::Yellow);
             match execute_clipboard_import(store, &text).await {
                 Ok(r) => {
                     if r.errors.is_empty() {
@@ -1703,6 +1721,64 @@ async fn handle_paste_confirm(
             app.paste_scroll = 0;
             app.screen = Screen::MainMenu;
             app.menu_idx = 1;
+        }
+        // Plain Enter in review mode (buffer non-empty): confirm import
+        KeyCode::Enter if !app.paste_json_buffer.is_empty() => {
+            let text = std::mem::take(&mut app.paste_json_buffer);
+            app.set_msg("Importing...", Color::Yellow);
+            match execute_clipboard_import(store, &text).await {
+                Ok(r) => {
+                    if r.errors.is_empty() {
+                        app.set_msg(format!("Imported: {}", r.summary()), Color::Green);
+                        app.set_toast(format!("Imported: {}", r.summary()));
+                    } else {
+                        app.set_msg(
+                            format!("Imported: {} | Errors: {}", r.summary(), r.errors[0]),
+                            Color::Yellow,
+                        );
+                    }
+                }
+                Err(e) => {
+                    app.set_msg(format!("Import failed: {}", e), Color::Red);
+                }
+            }
+            app.paste_scroll = 0;
+            app.screen = Screen::MainMenu;
+            app.menu_idx = 1;
+        }
+        // Plain Enter in input mode: add newline to buffer
+        KeyCode::Enter => {
+            app.paste_json_buffer.push('\n');
+        }
+        // Text input: any character gets appended to buffer (paste via terminal)
+        KeyCode::Char(c) => {
+            app.paste_json_buffer.push(c);
+        }
+        KeyCode::Backspace => {
+            app.paste_json_buffer.pop();
+        }
+        // Scroll when buffer has content
+        KeyCode::Up | KeyCode::Char('k') if !app.paste_json_buffer.is_empty() => {
+            if app.paste_scroll > 0 {
+                app.paste_scroll -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') if !app.paste_json_buffer.is_empty() => {
+            if app.paste_scroll + 1 < line_count {
+                app.paste_scroll += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            app.paste_scroll = app.paste_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            app.paste_scroll = (app.paste_scroll + 10).min(line_count.saturating_sub(1));
+        }
+        KeyCode::Home => {
+            app.paste_scroll = 0;
+        }
+        KeyCode::End => {
+            app.paste_scroll = line_count.saturating_sub(1);
         }
         _ => {}
     }
