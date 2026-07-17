@@ -1659,13 +1659,16 @@ async fn execute_clipboard_import(
         let access_token = acct.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
         let refresh_token = acct.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("");
 
-        if email.is_empty() || refresh_token.is_empty() {
-            errors.push(format!("Account {} missing email/refresh_token", i + 1));
+        if email.is_empty() {
+            errors.push(format!("Account {} missing email", i + 1));
             skipped += 1;
             continue;
         }
 
-        let label = acct.get("label").and_then(|v| v.as_str()).map(String::from);
+        // Official format: may have no tokens (just email/id/name from accounts.json)
+        let has_tokens = !refresh_token.is_empty();
+
+        let label = acct.get("label").or_else(|| acct.get("name")).and_then(|v| v.as_str()).map(String::from);
         let project_id = acct.get("project_id").and_then(|v| v.as_str()).map(String::from);
         let expiry_str = acct.get("expiry").and_then(|v| v.as_str()).unwrap_or("");
         let expiry = chrono::DateTime::parse_from_rfc3339(expiry_str)
@@ -1675,10 +1678,12 @@ async fn execute_clipboard_import(
         // Update existing by email, else add new
         if let Some(existing) = store.get_by_email(email).cloned() {
             let mut updated_account = existing;
-            updated_account.credential.access_token = access_token.to_string();
-            updated_account.credential.refresh_token = refresh_token.to_string();
-            updated_account.credential.expiry = expiry;
-            updated_account.credential.project_id = project_id.or(updated_account.credential.project_id);
+            if has_tokens {
+                updated_account.credential.access_token = access_token.to_string();
+                updated_account.credential.refresh_token = refresh_token.to_string();
+                updated_account.credential.expiry = expiry;
+                updated_account.credential.project_id = project_id.or(updated_account.credential.project_id);
+            }
             if let Some(l) = label.clone() {
                 updated_account.label = Some(l);
             }
