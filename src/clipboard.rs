@@ -3,6 +3,45 @@ use std::process::Command;
 /// Cross-platform clipboard abstraction.
 /// Tries `arboard` first, then falls back to CLI tools on Linux.
 /// Detects X11 vs Wayland and uses the correct tools.
+/// Auto-detects X11 sockets when DISPLAY env var is missing (SSH sessions).
+
+fn detect_display() -> Option<String> {
+    // Check if DISPLAY is already set
+    if let Ok(d) = std::env::var("DISPLAY") {
+        if !d.is_empty() {
+            return Some(d);
+        }
+    }
+    // Check for X11 sockets in /tmp/.X11-unix/
+    if let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('X') {
+                if let Some(num) = name_str.strip_prefix('X') {
+                    return Some(format!(":{}", num));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn with_display<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    // If DISPLAY is not set, try to detect it
+    if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
+        if let Some(display) = detect_display() {
+            std::env::set_var("DISPLAY", &display);
+            let result = f();
+            std::env::remove_var("DISPLAY");
+            return result;
+        }
+    }
+    f()
+}
 
 pub fn get_text() -> Result<String, String> {
     // Try arboard first (works on Windows, macOS, and Linux with libs)
@@ -17,8 +56,8 @@ pub fn get_text() -> Result<String, String> {
         }
     }
 
-    // CLI fallback
-    cli_get()
+    // CLI fallback with auto-detected DISPLAY
+    with_display(|| cli_get())
 }
 
 pub fn set_text(text: &str) -> Result<(), String> {
@@ -32,8 +71,8 @@ pub fn set_text(text: &str) -> Result<(), String> {
         }
     }
 
-    // CLI fallback
-    cli_set(text)
+    // CLI fallback with auto-detected DISPLAY
+    with_display(|| cli_set(text))
 }
 
 fn cli_get() -> Result<String, String> {
