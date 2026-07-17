@@ -34,9 +34,15 @@ where
     // If DISPLAY is not set, try to detect it
     if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
         if let Some(display) = detect_display() {
-            std::env::set_var("DISPLAY", &display);
+            // SAFETY: set_var/remove_var are unsafe in Rust 2024 but safe here —
+            // we're in a single-threaded clipboard call and restore the env after.
+            unsafe {
+                std::env::set_var("DISPLAY", &display);
+            }
             let result = f();
-            std::env::remove_var("DISPLAY");
+            unsafe {
+                std::env::remove_var("DISPLAY");
+            }
             return result;
         }
     }
