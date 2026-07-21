@@ -210,6 +210,11 @@ async fn run_loop(
     let mut last_render = std::time::Instant::now();
     let render_interval = std::time::Duration::from_millis(200);
 
+    // Background quota fetch state — runs fetch_all_quotas off the event loop
+    // so the TUI stays responsive during the 50-account HTTP burst.
+    let mut quota_fetch_in_progress = false;
+    let mut quota_fetch_rx: Option<tokio::sync::oneshot::Receiver<Vec<(uuid::Uuid, Result<crate::quota::models::QuotaSnapshot, AgySwitchError>)>>> = None;
+
     loop {
         // Render at most every 200ms (or immediately when data changes via needs_render flag).
         // This keeps the UI responsive for countdown timers without wasting CPU.
@@ -219,17 +224,62 @@ async fn run_loop(
             last_render = std::time::Instant::now();
         }
 
+        // Check if background quota fetch completed
+        if let Some(rx) = &mut quota_fetch_rx {
+            if let Ok(results) = rx.try_recv() {
+                quota_fetch_in_progress = false;
+                quota_fetch_rx = None;
+                // Apply results to the in-memory store
+                for (id, result) in results {
+                    match result {
+                        Ok(snapshot) => {
+                            if !snapshot.models.is_empty() {
+                                if let Some(account) = store.list().iter().find(|a| a.id == id).cloned() {
+                                    let mut updated_account = account;
+                                    updated_account.quota = Some(snapshot);
+                                    if updated_account.is_rate_limited {
+                                        updated_account.is_rate_limited = false;
+                                        updated_account.rate_limit_reset_at = None;
+                                    }
+                                    store.update_no_flush(updated_account);
+                                }
+                            }
+                        }
+                        Err(AgySwitchError::RateLimited { reset_at, .. }) => {
+                            if let Some(account) = store.list().iter().find(|a| a.id == id).cloned() {
+                                if !account.is_rate_limited {
+                                    let mut updated_account = account;
+                                    updated_account.is_rate_limited = true;
+                                    updated_account.rate_limit_reset_at =
+                                        Some(reset_at.unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::minutes(10)));
+                                    store.update_no_flush(updated_account);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = store.flush().await;
+                app.last_quota_refresh = Some(chrono::Utc::now());
+                render(term, store, state, app)?;
+                last_render = std::time::Instant::now();
+            } else {
+                // Not ready yet — continue with UI
+            }
+        }
+
         // In PasteConfirm input mode, buffer rapid keystrokes (terminal paste)
         // to avoid crashing the TUI with thousands of individual renders.
-        // Only exits after 80ms of silence (paste burst is over).
+        // Accepts both KeyEventKind::Press and KeyEventKind::Repeat because
+        // some terminals send Repeat events during fast paste bursts.
         if app.screen == Screen::PasteConfirm && app.paste_json_buffer.is_empty() {
             let mut input_buf = String::new();
             let mut escape = false;
-            // Keep reading events as long as they arrive within 80ms of each other
+            // Keep reading events as long as they arrive within 100ms of each other
             loop {
-                if crossterm::event::poll(std::time::Duration::from_millis(80)).map_err(io_err)? {
+                if crossterm::event::poll(std::time::Duration::from_millis(100)).map_err(io_err)? {
                     match crossterm::event::read().map_err(io_err)? {
-                        Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                             match k.code {
                                 KeyCode::Esc => {
                                     escape = true;
@@ -244,13 +294,16 @@ async fn run_loop(
                                 KeyCode::Backspace => {
                                     input_buf.pop();
                                 }
+                                KeyCode::Tab => {
+                                    input_buf.push('\t');
+                                }
                                 _ => {}
                             }
                         }
                         _ => {}
                     }
                 } else {
-                    break; // 80ms of silence — paste is done
+                    break; // 100ms of silence — paste is done
                 }
             }
             if escape {
@@ -275,7 +328,7 @@ async fn run_loop(
         let key = loop {
             if crossterm::event::poll(std::time::Duration::from_millis(100)).map_err(io_err)? {
                 match crossterm::event::read().map_err(io_err)? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                         break Some(k);
                     }
                     _ => {}
@@ -301,15 +354,19 @@ async fn run_loop(
                 app.clear_toast_if_expired();
             }
 
-            // API refresh: now that fetch_all_quotas batches flushes (1 disk write
-            // instead of 50), this is much faster. Still runs in the main loop so
-            // we don't need complex shared-state synchronization.
-            if last_api_refresh.elapsed() >= api_refresh_interval {
+            // API refresh: spawn background task so the TUI stays responsive.
+            // fetch_all_quotas makes 50 HTTP requests and takes 10-30s — must not block.
+            if last_api_refresh.elapsed() >= api_refresh_interval && !quota_fetch_in_progress {
                 last_api_refresh = std::time::Instant::now();
-                let _ = crate::store::active_writer::fetch_all_quotas(store).await;
-                app.last_quota_refresh = Some(chrono::Utc::now());
-                render(term, store, state, app)?;
-                last_render = std::time::Instant::now();
+                quota_fetch_in_progress = true;
+                // Snapshot accounts for the background task
+                let accounts_snapshot: Vec<_> = store.list().iter().cloned().collect();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                quota_fetch_rx = Some(rx);
+                tokio::spawn(async move {
+                    let results = fetch_quotas_background(accounts_snapshot).await;
+                    let _ = tx.send(results);
+                });
             }
         };
 
@@ -1800,7 +1857,12 @@ async fn handle_paste_confirm(
             app.set_msg("Importing...", Color::Yellow);
             match execute_clipboard_import(store, &text).await {
                 Ok(r) => {
-                    if r.errors.is_empty() {
+                    if r.imported == 0 && r.updated == 0 && r.errors.is_empty() {
+                        app.set_msg(
+                            format!("All {} accounts skipped (duplicates or no email)", r.skipped),
+                            Color::Yellow,
+                        );
+                    } else if r.errors.is_empty() {
                         app.set_msg(format!("Imported: {}", r.summary()), Color::Green);
                         app.set_toast(format!("Imported: {}", r.summary()));
                     } else {
@@ -1815,8 +1877,9 @@ async fn handle_paste_confirm(
                 }
             }
             app.paste_scroll = 0;
-            app.screen = Screen::MainMenu;
-            app.menu_idx = 1;
+            // Go directly to Switch Accounts so the user sees the result
+            app.screen = Screen::SwitchAccounts;
+            app.list_idx = 0;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.paste_scroll > 0 {
@@ -2248,4 +2311,35 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max.saturating_sub(3)])
     }
+}
+
+/// Background task: fetch quotas for all accounts concurrently.
+/// Returns a Vec of (account_id, result) tuples that the main thread applies.
+async fn fetch_quotas_background(
+    accounts: Vec<crate::store::account::Account>,
+) -> Vec<(uuid::Uuid, Result<crate::quota::models::QuotaSnapshot, AgySwitchError>)> {
+    use std::sync::Arc;
+    let concurrency = accounts.len().min(20);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+
+    for account in &accounts {
+        let cred = account.credential.clone();
+        let email = account.email.clone();
+        let id = account.id;
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        handles.push(tokio::spawn(async move {
+            let result = crate::quota::fetcher::get_model_quotas(&cred, &email).await;
+            drop(permit);
+            (id, result)
+        }));
+    }
+
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        if let Ok(result) = handle.await {
+            results.push(result);
+        }
+    }
+    results
 }
