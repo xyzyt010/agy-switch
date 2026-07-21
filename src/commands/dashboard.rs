@@ -207,9 +207,17 @@ async fn run_loop(
     let disk_reload_interval = std::time::Duration::from_secs(3);
     let mut last_api_refresh = std::time::Instant::now();
     let api_refresh_interval = std::time::Duration::from_secs(20);
+    let mut last_render = std::time::Instant::now();
+    let render_interval = std::time::Duration::from_millis(200);
 
     loop {
-        render(term, store, state, app)?;
+        // Render at most every 200ms (or immediately when data changes via needs_render flag).
+        // This keeps the UI responsive for countdown timers without wasting CPU.
+        let elapsed_since_render = last_render.elapsed();
+        if elapsed_since_render >= render_interval {
+            render(term, store, state, app)?;
+            last_render = std::time::Instant::now();
+        }
 
         // In PasteConfirm input mode, buffer rapid keystrokes (terminal paste)
         // to avoid crashing the TUI with thousands of individual renders.
@@ -250,18 +258,22 @@ async fn run_loop(
                 app.paste_scroll = 0;
                 app.screen = Screen::AccountsMenu;
                 app.menu_idx = 2;
+                render(term, store, state, app)?;
                 continue;
             }
             if !input_buf.is_empty() {
                 app.paste_json_buffer = input_buf;
                 app.paste_scroll = 0;
+                render(term, store, state, app)?;
                 continue; // Re-render with buffered paste
             }
-            // No paste activity — fall through to normal 1s poll
+            // No paste activity — fall through to normal poll
         }
 
+        // Poll for input with a short timeout (100ms) so housekeeping runs frequently.
+        // The old 1s poll caused visible lag when idle.
         let key = loop {
-            if crossterm::event::poll(std::time::Duration::from_secs(1)).map_err(io_err)? {
+            if crossterm::event::poll(std::time::Duration::from_millis(100)).map_err(io_err)? {
                 match crossterm::event::read().map_err(io_err)? {
                     Event::Key(k) if k.kind == KeyEventKind::Press => {
                         break Some(k);
@@ -270,32 +282,34 @@ async fn run_loop(
                 }
             }
 
+            // --- Periodic housekeeping (runs during poll timeouts) ---
+
+            // Disk reload: uses mtime check inside load() to skip if unchanged.
             if last_disk_reload.elapsed() >= disk_reload_interval {
                 last_disk_reload = std::time::Instant::now();
+                let old_count = store.count();
                 let _ = store.load().await;
-                // Clamp list_idx to valid range after reload
-                let count = store.count();
-                if count == 0 {
-                    app.list_idx = 0;
-                } else if app.list_idx >= count {
-                    app.list_idx = count - 1;
+                let new_count = store.count();
+                if old_count != new_count {
+                    if new_count == 0 {
+                        app.list_idx = 0;
+                    } else if app.list_idx >= new_count {
+                        app.list_idx = new_count - 1;
+                    }
+                    render(term, store, state, app)?;
                 }
                 app.clear_toast_if_expired();
             }
 
+            // API refresh: now that fetch_all_quotas batches flushes (1 disk write
+            // instead of 50), this is much faster. Still runs in the main loop so
+            // we don't need complex shared-state synchronization.
             if last_api_refresh.elapsed() >= api_refresh_interval {
                 last_api_refresh = std::time::Instant::now();
-                match crate::store::active_writer::fetch_all_quotas(store).await {
-                    Ok(n) if n > 0 => {
-                        let _ = store.flush().await;
-                        app.last_quota_refresh = Some(chrono::Utc::now());
-                    }
-                    Ok(_) => {
-                        app.last_quota_refresh = Some(chrono::Utc::now());
-                    }
-                    Err(_) => {}
-                }
+                let _ = crate::store::active_writer::fetch_all_quotas(store).await;
+                app.last_quota_refresh = Some(chrono::Utc::now());
                 render(term, store, state, app)?;
+                last_render = std::time::Instant::now();
             }
         };
 
@@ -666,7 +680,7 @@ fn draw_switch_accounts(
 
             let (status_icon, status_color) = if !a.enabled {
                 ("\u{2716}", Color::Red)
-            } else if a.is_rate_limited {
+            } else if is_effectively_rate_limited(a) {
                 ("\u{26A0}", Color::Yellow)
             } else if is_active {
                 ("\u{25CF}", Color::Green)
@@ -720,6 +734,8 @@ fn draw_switch_accounts(
                 ));
             }
 
+            // Rate limit countdown is intentionally NOT shown as a second line in the list;
+            // it's only displayed in the account detail panel (keep list compact).
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -818,7 +834,20 @@ fn draw_paste_confirm(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let content = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Waiting for paste... (Ctrl+Shift+V or right-click)",
+                "  1. Copy JSON to clipboard (Ctrl+C from a file or browser)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  2. Right-click here to paste (or Ctrl+Shift+V in some terminals)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  3. Press Enter to import",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Expected format: {\"accounts\":[{\"email\":\"...\",...}]}",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(""),
@@ -874,7 +903,6 @@ fn draw_paste_confirm(f: &mut ratatui::Frame, area: Rect, app: &App) {
         )))
     } else {
         let total = app.paste_json_buffer.lines().count();
-        let start = app.paste_scroll.min(total.saturating_sub(1));
         Paragraph::new(Line::from(Span::styled(
             format!(
                 " Lines: {}   \u{2191}\u{2193} Scroll   Enter Import   Esc Back ",
@@ -916,7 +944,7 @@ fn draw_detail_pane(
     lines.push(Line::from(vec![
         Span::styled("  Status   ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            if a.is_rate_limited {
+            if is_effectively_rate_limited(a) {
                 "RATE LIMITED"
             } else if is_active {
                 "ACTIVE"
@@ -925,8 +953,8 @@ fn draw_detail_pane(
             } else {
                 "DISABLED"
             },
-            Style::default().fg(if a.is_rate_limited {
-                Color::Red
+            Style::default().fg(if is_effectively_rate_limited(a) {
+                Color::Magenta
             } else if is_active {
                 Color::Green
             } else if a.enabled {
@@ -937,27 +965,19 @@ fn draw_detail_pane(
         ),
     ]));
 
-    if a.is_rate_limited {
-        let mut rl_text = "RATE LIMITED".to_string();
-        if let Some(reset) = a.rate_limit_reset_at {
-            let now = chrono::Utc::now();
-            if reset > now {
-                let remaining = (reset - now).num_seconds();
-                if remaining >= 3600 {
-                    rl_text = format!("RATE LIMITED (resets in {}h)", remaining / 3600);
-                } else if remaining >= 60 {
-                    rl_text = format!("RATE LIMITED (resets in {}m)", remaining / 60);
-                } else {
-                    rl_text = format!("RATE LIMITED (resets in {}s)", remaining);
-                }
+    if is_effectively_rate_limited(a) {
+        let rl_text = match effective_rate_limit_reset(a) {
+            Some(reset) if reset > chrono::Utc::now() => {
+                format!("RATE LIMITED — resets in {}", format_countdown(reset))
             }
-        }
+            _ => "RATE LIMITED — reset time unknown".to_string(),
+        };
         lines.push(Line::from(vec![
             Span::styled("  Warning  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 rl_text,
                 Style::default()
-                    .fg(Color::Red)
+                    .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -979,10 +999,11 @@ fn draw_detail_pane(
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
+            let now = chrono::Utc::now();
             for m in &quota.models {
                 let pct = m.remaining_fraction.map_or(100u64, |f| (f * 100.0).round() as u64);
 
-                let (bar, bar_color, status_suffix) = if a.is_rate_limited {
+                let (bar, bar_color, status_suffix) = if is_effectively_rate_limited(a) {
                     let s = " ▓▓▓▓▓▓▓▓▓▓".to_string();
                     (s, Color::Red, " RATE LIMITED")
                 } else if m.is_exhausted {
@@ -991,6 +1012,18 @@ fn draw_detail_pane(
                 } else {
                     let (b, c) = quota_bar(pct);
                     (b, c, "")
+                };
+
+                // Per-model reset countdown when exhausted with a future reset time,
+                // shown as a small gray "resets in 2H 30M" note. Style like antigravity
+                // claude proxy's compact detail column.
+                let reset_note = if m.is_exhausted {
+                    m.reset_at
+                        .filter(|t| *t > now)
+                        .map(|t| format!("  resets in {}", format_countdown(t)))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
                 };
 
                 lines.push(Line::from(vec![
@@ -1002,18 +1035,22 @@ fn draw_detail_pane(
                     Span::styled(bar, Style::default().fg(bar_color)),
                     Span::styled(
                         format!(" {}%{}", pct, status_suffix),
-                        Style::default().fg(if a.is_rate_limited || m.is_exhausted {
+                        Style::default().fg(if is_effectively_rate_limited(a) || m.is_exhausted {
                             Color::Red
                         } else {
                             bar_color
                         }),
                     ),
+                    Span::styled(
+                        reset_note,
+                        Style::default().fg(Color::DarkGray),
+                    ),
                 ]));
             }
         }
     } else {
-        let (status_text, status_color) = if a.is_rate_limited {
-            ("  Rate limited (no quota data)", Color::Red)
+        let (status_text, status_color) = if is_effectively_rate_limited(a) {
+            ("  Rate limited (no quota data)", Color::Magenta)
         } else if !a.enabled {
             ("  Account disabled", Color::Red)
         } else {
@@ -1510,17 +1547,25 @@ async fn handle_accounts_menu(
                         let parsed: serde_json::Value = match serde_json::from_str(&text) {
                             Ok(v) => v,
                             Err(e) => {
-                                app.set_msg(format!("Invalid JSON: {}", e), Color::Red);
+                                app.set_msg(
+                                    format!("Clipboard is not valid JSON: {}. Copy accounts JSON first, then try again.", e),
+                                    Color::Red,
+                                );
                                 return Ok(());
                             }
                         };
+                        // Accept: {"accounts":[...]} OR bare [...] array
                         let accounts_arr = parsed
                             .get("accounts")
                             .and_then(|v| v.as_array())
                             .cloned()
+                            .or_else(|| parsed.as_array().cloned())
                             .unwrap_or_default();
                         if accounts_arr.is_empty() {
-                            app.set_msg("No accounts found in clipboard JSON", Color::Yellow);
+                            app.set_msg(
+                                "Clipboard JSON has no accounts. Expected {\"accounts\":[...]} or [...]. Copy accounts first.",
+                                Color::Yellow,
+                            );
                             return Ok(());
                         }
                         app.paste_json_buffer = text;
@@ -1529,10 +1574,12 @@ async fn handle_accounts_menu(
                         app.screen = Screen::PasteConfirm;
                     }
                     _ => {
-                        // Clipboard unavailable — enter input mode for terminal paste
+                        // Clipboard empty or unavailable — enter input mode for terminal paste.
+                        // Show clear instructions so user knows what to do.
                         app.paste_json_buffer.clear();
                         app.paste_scroll = 0;
                         app.screen = Screen::PasteConfirm;
+                        app.set_toast("Clipboard empty. Copy JSON first, then select Paste again.".to_string());
                     }
                 }
             }
@@ -1636,10 +1683,12 @@ async fn execute_clipboard_import(
     // Count current accounts + incoming accounts; enforce 150-account hard limit
     let parsed: serde_json::Value = serde_json::from_str(json_text)
         .map_err(|e| AgySwitchError::OAuthFailed(format!("JSON parse: {}", e)))?;
+    // Accept: {"accounts":[...]} OR bare [...] array
     let accounts_arr = parsed
         .get("accounts")
         .and_then(|v| v.as_array())
         .cloned()
+        .or_else(|| parsed.as_array().cloned())
         .unwrap_or_default();
 
     let mut errors = Vec::new();
@@ -2042,24 +2091,71 @@ fn handle_mode_menu(key: KeyEvent, app: &mut App, state: &mut AppState) {
     }
 }
 
+/// Determine if an account is effectively rate-limited based on actual quota data.
+///
+/// An account is considered rate-limited when:
+///   - At least one model is exhausted (remaining_fraction <= 0.0)
+///   - That model has a reset_at time in the future
+///
+/// Returns:
+///   - `Some(reset_at)` when the account is rate-limited (the soonest reset_at among
+///     exhausted models that have a future reset time)
+///   - `None` when not rate-limited per quota data
+///
+/// This is independent of the `Account.is_rate_limited` flag (set on HTTP 429) because
+/// the Cloud Code quota API returns 200 OK with remaining_fraction=0 for exhausted
+/// models — the actual rate limit state lives in the quota body, not HTTP status.
+fn quota_rate_limit_reset(a: &crate::store::account::Account) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !a.enabled {
+        return None;
+    }
+    let quota = a.quota.as_ref()?;
+    let now = chrono::Utc::now();
+    let mut soonest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for m in &quota.models {
+        if !m.is_exhausted {
+            continue;
+        }
+        if let Some(reset) = m.reset_at {
+            if reset > now {
+                soonest = Some(match soonest {
+                    Some(s) if s < reset => s,
+                    _ => reset,
+                });
+            }
+        }
+    }
+    soonest
+}
+
+/// True when the account is effectively rate-limited per quota data or the explicit
+/// `is_rate_limited` flag (set on HTTP 429). The quota-data path is the common case
+/// because Cloud Code doesn't use 429 for quota exhaustion.
+fn is_effectively_rate_limited(a: &crate::store::account::Account) -> bool {
+    a.is_rate_limited || quota_rate_limit_reset(a).is_some()
+}
+
+/// The soonest reset time across both rate-limit signals (HTTP 429 flag and quota data).
+fn effective_rate_limit_reset(a: &crate::store::account::Account) -> Option<chrono::DateTime<chrono::Utc>> {
+    let from_quota = quota_rate_limit_reset(a);
+    let from_flag = a.rate_limit_reset_at.filter(|t| *t > chrono::Utc::now());
+    match (from_quota, from_flag) {
+        (Some(q), Some(f)) => Some(q.min(f)),
+        (Some(q), None) => Some(q),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    }
+}
+
 fn compute_quota_remaining_str(a: &crate::store::account::Account) -> String {
     if !a.enabled {
         return "disabled".to_string();
     }
+    // Effective rate limit (HTTP 429 flag OR quota-driven exhaustion with future reset)
+    if let Some(reset) = effective_rate_limit_reset(a) {
+        return format!("rate limited (reset in {})", format_countdown(reset));
+    }
     if a.is_rate_limited {
-        if let Some(reset) = a.rate_limit_reset_at {
-            let now = chrono::Utc::now();
-            if reset > now {
-                let remaining = (reset - now).num_seconds();
-                if remaining >= 3600 {
-                    return format!("rate limited ({}h left)", remaining / 3600);
-                } else if remaining >= 60 {
-                    return format!("rate limited ({}m left)", remaining / 60);
-                } else {
-                    return format!("rate limited ({}s left)", remaining);
-                }
-            }
-        }
         return "rate limited".to_string();
     }
     let Some(quota) = &a.quota else {
@@ -2081,6 +2177,41 @@ fn compute_quota_remaining_str(a: &crate::store::account::Account) -> String {
         Some(pct) if pct <= 0 => "exhausted".to_string(),
         Some(pct) => format!("{}% left", pct),
         None => "unknown".to_string(),
+    }
+}
+
+/// Format a rate limit reset time as a human-readable countdown.
+/// Style mirrors antigravity-claude-proxy: "2H 30M", "45M", "30S", or "READY".
+/// Returns the time until `reset_at` from now. Empty string if `reset_at` is None.
+fn format_countdown(reset_at: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    if reset_at <= now {
+        return "READY".to_string();
+    }
+    let dur = reset_at - now;
+    let total_secs = dur.num_seconds().max(0);
+    let hrs = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    if hrs > 0 {
+        format!("{}H {}M", hrs, mins)
+    } else if mins > 0 {
+        format!("{}M", mins)
+    } else {
+        format!("{}S", secs)
+    }
+}
+
+/// Build a compact one-line rate limit status string for the account list.
+/// Example outputs: "RL 45M", "RL 2H 30M", "RL READY", "RL ~10M" (when no reset time).
+#[allow(dead_code)]
+fn rate_limit_short(a: &crate::store::account::Account) -> String {
+    if !a.is_rate_limited {
+        return String::new();
+    }
+    match a.rate_limit_reset_at {
+        Some(reset) => format!("RL {}", format_countdown(reset)),
+        None => "RL".to_string(),
     }
 }
 

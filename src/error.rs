@@ -12,8 +12,11 @@ pub enum AgySwitchError {
     #[error("Token refresh failed for {email}: {reason}")]
     TokenRefreshFailed { email: String, reason: String },
 
-    #[error("Rate limited (HTTP 429) for {0}")]
-    RateLimited(String),
+    #[error("Rate limited (HTTP 429) for {endpoint}")]
+    RateLimited {
+        endpoint: String,
+        reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
 
     #[error("File I/O error: {0}")]
     Io(#[from] std::io::Error),

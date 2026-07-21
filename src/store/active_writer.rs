@@ -817,6 +817,7 @@ pub async fn refresh_accounts_from_official(
 
 /// Fetch real quota from Google API for all accounts in the store.
 /// Uses concurrent requests (10 at a time) for speed.
+/// Batches all store updates in memory and flushes once at the end.
 pub async fn fetch_all_quotas(
     store: &mut crate::store::file_store::FileStore,
 ) -> Result<u32, AgySwitchError> {
@@ -855,26 +856,34 @@ pub async fn fetch_all_quotas(
                             updated_account.is_rate_limited = false;
                             updated_account.rate_limit_reset_at = None;
                         }
-                        let _ = store.update(updated_account).await;
+                        // Update in memory only — flush once after all accounts
+                        store.update_no_flush(updated_account);
                         updated += 1;
                     }
                 }
             }
-            Ok((id, Err(AgySwitchError::RateLimited(_)))) => {
+            Ok((id, Err(AgySwitchError::RateLimited { reset_at, .. }))) => {
                 // Mark account as rate limited
                 if let Some(account) = store.list().iter().find(|a| a.id == id).cloned() {
                     if !account.is_rate_limited {
                         let mut updated_account = account;
                         updated_account.is_rate_limited = true;
+                        // Use API-provided reset time if available; otherwise default to 10 minutes.
                         updated_account.rate_limit_reset_at =
-                            Some(chrono::Utc::now() + chrono::Duration::hours(1));
-                        let _ = store.update(updated_account).await;
+                            Some(reset_at.unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::minutes(10)));
+                        // Update in memory only — flush once after all accounts
+                        store.update_no_flush(updated_account);
                         rate_limited += 1;
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    // Flush once after all updates instead of per-account
+    if updated > 0 || rate_limited > 0 {
+        let _ = store.flush().await;
     }
 
     // Logging disabled — these eprintln leak into the TUI alt screen on Windows.

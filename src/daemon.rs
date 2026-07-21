@@ -127,7 +127,7 @@ async fn quota_check_and_auto_switch() -> Result<(), AgySwitchError> {
                 );
             }
         }
-        Err(AgySwitchError::RateLimited(endpoint)) => {
+        Err(AgySwitchError::RateLimited { endpoint, reset_at }) => {
             eprintln!(
                 "[AGY-SWITCH] Account {} rate limited (429 from {}), marking...",
                 active_account.email, endpoint
@@ -136,8 +136,10 @@ async fn quota_check_and_auto_switch() -> Result<(), AgySwitchError> {
             if let Some(mut acc) = store.get(active_id).cloned() {
                 if !acc.is_rate_limited {
                     acc.is_rate_limited = true;
-                    // Default rate limit window: 1 hour from now
-                    acc.rate_limit_reset_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+                    // Use API-provided reset time if available; otherwise default to 10 minutes
+                    // (chosen empirically — Cloud Code quota windows usually reset within minutes,
+                    // and the daemon re-checks every 10s anyway).
+                    acc.rate_limit_reset_at = Some(reset_at.unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::minutes(10)));
                     let _ = store.update(acc).await;
 
                     // Auto-switch if in auto mode

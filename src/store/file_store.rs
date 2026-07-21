@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::config::ensure_config_dir;
 use crate::error::AgySwitchError;
@@ -10,6 +11,8 @@ use uuid::Uuid;
 pub struct FileStore {
     accounts: Vec<Account>,
     path: PathBuf,
+    /// Track mtime to skip re-reads when the file hasn't changed.
+    last_loaded_mtime: Option<SystemTime>,
 }
 
 impl FileStore {
@@ -17,15 +20,34 @@ impl FileStore {
         FileStore {
             accounts: Vec::new(),
             path,
+            last_loaded_mtime: None,
         }
     }
 
-    /// Load accounts from disk
+    /// Load accounts from disk. Skips re-read if file mtime hasn't changed since last load.
     pub async fn load(&mut self) -> Result<(), AgySwitchError> {
         if !tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
             return Ok(());
         }
-        let contents = tokio::fs::read_to_string(&self.path).await.map_err(AgySwitchError::Io)?;
+        // Skip re-read if file hasn't been modified since last load
+        if let Ok(metadata) = tokio::fs::metadata(&self.path).await {
+            if let Ok(mtime) = metadata.modified() {
+                if self.last_loaded_mtime == Some(mtime) {
+                    return Ok(());
+                }
+                self.last_loaded_mtime = Some(mtime);
+            }
+        }
+        let raw = tokio::fs::read(&self.path).await.map_err(AgySwitchError::Io)?;
+        // Reject files with null bytes (corrupted) — treat as empty
+        if raw.windows(1).any(|w| w[0] == 0) {
+            let _ = tokio::fs::rename(&self.path, &self.path.with_extension("json.corrupted")).await;
+            self.accounts = Vec::new();
+            return Ok(());
+        }
+        let contents = String::from_utf8(raw).map_err(|e| {
+            AgySwitchError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
         if contents.trim().is_empty() {
             self.accounts = Vec::new();
             return Ok(());
@@ -95,17 +117,15 @@ impl FileStore {
         &self.accounts
     }
 
-    /// List accounts sorted by quota percentage descending (100% at top), then A-Z.
-    /// Rate-limited and disabled accounts go at the bottom.
+    /// List accounts sorted by:
+    ///   1. 100% first, descending percentage (101% → 1%)
+    ///   2. Exhausted/rate-limited accounts sorted by soonest reset time FIRST
+    ///      (least time until refresh → most time until refresh)
+    ///   3. Disabled accounts
+    ///   Within each tier, ties are broken A-Z by email.
     pub fn list_sorted(&self) -> Vec<Account> {
         let mut accounts: Vec<Account> = self.accounts.iter().cloned().collect();
-        accounts.sort_by(|a, b| {
-            let pa = sort_key(a);
-            let pb = sort_key(b);
-            pb.partial_cmp(&pa)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.email.cmp(&b.email))
-        });
+        accounts.sort_by(|a, b| sort_comparator(a, b));
         accounts
     }
 
@@ -114,12 +134,20 @@ impl FileStore {
         &mut self.accounts
     }
 
-    /// Update an existing account (matched by id)
+    /// Update an existing account (matched by id) and flush to disk.
     pub async fn update(&mut self, account: Account) -> Result<(), AgySwitchError> {
         let index = self.accounts.iter().position(|a| a.id == account.id)
             .ok_or_else(|| AgySwitchError::AccountNotFound(account.id.to_string()))?;
         self.accounts[index] = account;
         self.flush().await
+    }
+
+    /// Update an existing account in memory only (no disk flush).
+    /// Call `flush()` once after a batch of updates to write everything at once.
+    pub fn update_no_flush(&mut self, account: Account) {
+        if let Some(index) = self.accounts.iter().position(|a| a.id == account.id) {
+            self.accounts[index] = account;
+        }
     }
 
     /// Number of accounts
@@ -166,6 +194,7 @@ impl FileStore {
     /// Find next available account in sorted order (highest quota first, A-Z within tier),
     /// skipping the current account, disabled, rate-limited, and exhausted ones.
     pub fn next_available_by_id(&self, current_id: Uuid) -> Option<(usize, Account)> {
+        let now = chrono::Utc::now();
         let sorted = self.list_sorted();
         for account in &sorted {
             if account.id == current_id {
@@ -174,22 +203,32 @@ impl FileStore {
             if !account.enabled {
                 continue;
             }
-            if account.is_rate_limited {
-                if let Some(reset) = account.rate_limit_reset_at {
-                    if reset > chrono::Utc::now() {
-                        continue;
-                    }
-                }
+            // Skip HTTP-429 rate-limited accounts whose reset is still in the future.
+            if account.is_rate_limited
+                && account
+                    .rate_limit_reset_at
+                    .map(|t| t > now)
+                    .unwrap_or(false)
+            {
+                continue;
             }
-            // Skip accounts with exhausted quota
+            // Skip accounts whose quota shows any exhausted model with a future reset
+            // (these are effectively rate limited per Cloud Code semantics).
             if let Some(quota) = &account.quota {
-                if !quota.models.is_empty() {
-                    let all_exhausted = quota.models.iter().all(|m| {
-                        m.remaining_fraction.map_or(false, |f| f <= 0.0)
-                    });
-                    if all_exhausted {
-                        continue;
-                    }
+                if quota.models.iter().any(|m| {
+                    m.is_exhausted
+                        && m.reset_at.map(|t| t > now).unwrap_or(false)
+                }) {
+                    continue;
+                }
+                // Also skip accounts where every model is exhausted (even without a future reset),
+                // since there's no immediate capacity available.
+                if !quota.models.is_empty()
+                    && quota.models.iter().all(|m| {
+                        m.remaining_fraction.map(|f| f <= 0.0).unwrap_or(false)
+                    })
+                {
+                    continue;
                 }
             }
             return Some((0, account.clone()));
@@ -198,32 +237,165 @@ impl FileStore {
     }
 }
 
-/// Sort key for accounts: higher = better quota.
-/// - Active rate limited: -3.0
-/// - Disabled: -2.0
-/// - Exhausted (all 0%): -1.0
-/// - Healthy: actual min remaining fraction (0.0 to 1.0)
-/// - No quota data: 0.0 (treat as empty)
+/// Sort comparator implementing the requested account ordering:
+///   1. Disabled accounts last.
+///   2. 100% quota first, descending percentage.
+///   3. Exhausted / rate-limited accounts sorted by least-to-most reset time
+///      (soonest refresh first). Accounts without a reset time go at the very
+///      bottom of this tier.
+///   4. Within each tier, A-Z by email.
+fn sort_comparator(a: &Account, b: &Account) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let now = chrono::Utc::now();
+
+    // Comparison result says whether `a` should come BEFORE `b`
+    // (i.e. this returns Less if a sorts higher in the list).
+
+    // --- Disabled: always last
+    if a.enabled != b.enabled {
+        return if a.enabled { Less } else { Greater };
+    }
+    if !a.enabled {
+        return a.email.cmp(&b.email);
+    }
+
+    // Compute the min remaining fraction across models for each account
+    let min_frac = |acc: &Account| -> Option<f64> {
+        acc.quota.as_ref().and_then(|q| {
+            q.models
+                .iter()
+                .filter_map(|m| m.remaining_fraction)
+                .fold(None, |acc: Option<f64>, v: f64| {
+                    Some(acc.map(|c: f64| c.min(v)).unwrap_or(v))
+                })
+        })
+    };
+
+    // Earliest future reset_at among exhausted models (in seconds from now; None if N/A)
+    let soonest_reset_secs = |acc: &Account| -> Option<i64> {
+        let q = acc.quota.as_ref()?;
+        let mut soonest: Option<i64> = None;
+        for m in &q.models {
+            if !m.is_exhausted {
+                continue;
+            }
+            if let Some(reset) = m.reset_at {
+                let secs = (reset - now).num_seconds();
+                if secs > 0 {
+                    soonest = Some(match soonest {
+                        Some(s) if s < secs => s,
+                        _ => secs,
+                    });
+                }
+            }
+        }
+        // Also consider the explicit HTTP 429 flag's reset_at
+        if acc.is_rate_limited {
+            if let Some(reset) = acc.rate_limit_reset_at {
+                let secs = (reset - now).num_seconds();
+                if secs > 0 {
+                    soonest = Some(match soonest {
+                        Some(s) if s < secs => s,
+                        _ => secs,
+                    });
+                }
+            }
+        }
+        soonest
+    };
+
+    let af = min_frac(a);
+    let bf = min_frac(b);
+
+    let a_min_zero = af.map(|f| f <= 0.0).unwrap_or(false);
+    let b_min_zero = bf.map(|f| f <= 0.0).unwrap_or(false);
+
+    // --- Account is "effectively rate limited" if it has a future reset time OR
+    //     (its 429 flag is set with a future reset_at). Without a future reset,
+    //     exhausted accounts sort below healthy but above accounts with no
+    //     "real" reset signature.
+    let a_reset_secs = soonest_reset_secs(a);
+    let b_reset_secs = soonest_reset_secs(b);
+    let a_rl = a_reset_secs.is_some();
+    let b_rl = b_reset_secs.is_some();
+
+    // --- Tiering rule (high → low in the list):
+    //   Healthy (frac > 0)         : sorted by fraction DESC
+    //   Unknown quota / no models   : below healthy but above exhausted-without-reset
+    //   Exhausted with future reset : soonest reset FIRST (least M → most M)
+    //   Exhausted without future reset (reset unknown) : below that
+    if a_min_zero && b_min_zero {
+        if a_rl && b_rl {
+            // Both rate-limited: least reset time first
+            return a_reset_secs
+                .cmp(&b_reset_secs)
+                .then_with(|| a.email.cmp(&b.email));
+        }
+        if a_rl {
+            return Less; // a has reset info, b doesn't → a first
+        }
+        if b_rl {
+            return Greater;
+        }
+        return a.email.cmp(&b.email); // neither has reset info
+    }
+
+    if a_min_zero {
+        // a is exhausted but b has quota → b healthy comes first
+        return Greater;
+    }
+    if b_min_zero {
+        return Less;
+    }
+
+    // Both nonzero quota (or unknown): sort by frac DESC, unknown (None) below known.
+    match (af, bf) {
+        (Some(av), Some(bv)) => bv
+            .partial_cmp(&av)
+            .unwrap_or(Equal)
+            .then_with(|| a.email.cmp(&b.email)),
+        (Some(_), None) => Less,
+        (None, Some(_)) => Greater,
+        (None, None) => a.email.cmp(&b.email),
+    }
+}
+
+/// Legacy sort key — retained for next_available()'s filter-based logic.
+/// Higher = better quota. Only used for that purpose; list_sorted() uses
+/// sort_comparator directly.
+#[allow(dead_code)]
 fn sort_key(account: &Account) -> f64 {
     if !account.enabled {
         return -2.0;
     }
-    if account.is_rate_limited {
-        if let Some(reset) = account.rate_limit_reset_at {
-            if reset > chrono::Utc::now() {
-                return -3.0;
-            }
-        }
+    let now = chrono::Utc::now();
+    if account.is_rate_limited
+        && account
+            .rate_limit_reset_at
+            .map(|t| t > now)
+            .unwrap_or(false)
+    {
+        return -3.0;
     }
     match &account.quota {
         Some(quota) if quota.models.is_empty() => 0.0,
         Some(quota) => {
-            let min_frac = quota
-                .models
-                .iter()
-                .filter_map(|m| m.remaining_fraction)
-                .fold(f64::INFINITY, f64::min);
-            if min_frac.is_infinite() {
+            let (mut min_frac, mut has_future_reset) = (f64::INFINITY, false);
+            for m in &quota.models {
+                if let Some(f) = m.remaining_fraction {
+                    min_frac = min_frac.min(f);
+                }
+                if m.is_exhausted
+                    && m.reset_at
+                        .map(|t| t > now)
+                        .unwrap_or(false)
+                {
+                    has_future_reset = true;
+                }
+            }
+            if has_future_reset {
+                -3.0
+            } else if min_frac.is_infinite() {
                 0.0
             } else {
                 min_frac

@@ -97,11 +97,12 @@ async fn fetch_available_models(
         }
 
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
         if status.as_u16() == 429 {
-            return Err(AgySwitchError::RateLimited(endpoint.to_string()));
+            let reset_at = extract_reset_time(&text);
+            return Err(AgySwitchError::RateLimited { endpoint: endpoint.to_string(), reset_at });
         }
 
-        let text = resp.text().await.unwrap_or_default();
         let _ = (endpoint, status, &text);
         return Err(AgySwitchError::OAuthFailed(format!("fetchAvailableModels {}: {}", status, &text[..text.len().min(200)])));
     }
@@ -143,11 +144,12 @@ async fn retrieve_user_quota(
         }
 
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
         if status.as_u16() == 429 {
-            return Err(AgySwitchError::RateLimited(endpoint.to_string()));
+            let reset_at = extract_reset_time(&text);
+            return Err(AgySwitchError::RateLimited { endpoint: endpoint.to_string(), reset_at });
         }
 
-        let text = resp.text().await.unwrap_or_default();
         let _ = (endpoint, status, &text);
         return Err(AgySwitchError::OAuthFailed(format!("retrieveUserQuota {}: {}", status, &text[..text.len().min(200)])));
     }
@@ -183,11 +185,12 @@ async fn load_code_assist(
         }
 
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
         if status.as_u16() == 429 {
-            return Err(AgySwitchError::RateLimited(endpoint.to_string()));
+            let reset_at = extract_reset_time(&text);
+            return Err(AgySwitchError::RateLimited { endpoint: endpoint.to_string(), reset_at });
         }
 
-        let text = resp.text().await.unwrap_or_default();
         let _ = (endpoint, status, &text);
         return Err(AgySwitchError::OAuthFailed(format!("loadCodeAssist {}: {}", status, &text[..text.len().min(200)])));
     }
@@ -195,6 +198,74 @@ async fn load_code_assist(
     Err(AgySwitchError::OAuthFailed(
         "loadCodeAssist failed on all endpoints".to_string(),
     ))
+}
+
+/// Extract reset time from a 429 response body.
+/// Tries common field names used by Google Cloud Code API:
+///   - "resetTime" (ISO 8601 string, used by retrieveUserQuota/fetchAvailableModels)
+///   - "retryAfter" or "retry_after" (seconds as number or ISO string)
+///   - "resetTimestamp" (ISO 8601 string)
+/// Returns None if no reset time can be parsed; caller falls back to a default.
+fn extract_reset_time(body: &str) -> Option<DateTime<Utc>> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+
+    // Try "resetTime" (top-level, ISO 8601 string)
+    if let Some(rt) = value.get("resetTime").and_then(|v| v.as_str()) {
+        if let Ok(dt) = rt.parse::<DateTime<Utc>>() {
+            return Some(dt);
+        }
+    }
+
+    // Try nested "buckets"[0].resetTime (retrieveUserQuota-style)
+    if let Some(buckets) = value.get("buckets").and_then(|v| v.as_array()) {
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for bucket in buckets {
+            if let Some(rt) = bucket.get("resetTime").and_then(|v| v.as_str()) {
+                if let Ok(dt) = rt.parse::<DateTime<Utc>>() {
+                    earliest = Some(match earliest {
+                        Some(e) if e < dt => e,
+                        _ => dt,
+                    });
+                }
+            }
+        }
+        if let Some(dt) = earliest {
+            return Some(dt);
+        }
+    }
+
+    // Try "resetTimestamp" (ISO 8601 string)
+    if let Some(rt) = value.get("resetTimestamp").and_then(|v| v.as_str()) {
+        if let Ok(dt) = rt.parse::<DateTime<Utc>>() {
+            return Some(dt);
+        }
+    }
+
+    // Try "retryAfter" as integer seconds
+    if let Some(secs) = value.get("retryAfter").and_then(|v| v.as_i64()) {
+        if secs > 0 {
+            return Some(Utc::now() + chrono::Duration::seconds(secs));
+        }
+    }
+
+    // Try "retry_after" as integer seconds
+    if let Some(secs) = value.get("retry_after").and_then(|v| v.as_i64()) {
+        if secs > 0 {
+            return Some(Utc::now() + chrono::Duration::seconds(secs));
+        }
+    }
+
+    // Try ISO 8601 string in "retryAfter"
+    if let Some(rt) = value.get("retryAfter").and_then(|v| v.as_str()) {
+        if let Ok(dt) = rt.parse::<DateTime<Utc>>() {
+            return Some(dt);
+        }
+    }
+
+    None
 }
 
 /// Fetch model quotas for an account. Returns a QuotaSnapshot with real data
