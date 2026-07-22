@@ -194,18 +194,13 @@ pub async fn handle_add_json(
         };
 
         // Support both snake_case (refresh_token) and camelCase (refreshToken)
+        // Official accounts.json may not have tokens — accept them anyway.
         let refresh_token = item
             .get("refresh_token")
             .or_else(|| item.get("refreshToken"))
-            .and_then(|v| v.as_str());
-        let refresh_token = match refresh_token {
-            Some(t) => t.to_string(),
-            None => {
-                result.skipped += 1;
-                result.errors.push(format!("{} skipped — no refresh token", email));
-                continue;
-            }
-        };
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Support both access_token and accessToken
         let access_token = item

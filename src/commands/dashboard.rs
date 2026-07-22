@@ -272,19 +272,17 @@ async fn run_loop(
         // to avoid crashing the TUI with thousands of individual renders.
         // Accepts both KeyEventKind::Press and KeyEventKind::Repeat because
         // some terminals send Repeat events during fast paste bursts.
+        // IMPORTANT: Ignore Esc during paste collection because bracketed paste
+        // mode sends \x1b[200~...\x1b[201~ wrapper which contains Esc characters.
+        // Only honor Esc if it's the ONLY key pressed (user wants to cancel).
         if app.screen == Screen::PasteConfirm && app.paste_json_buffer.is_empty() {
             let mut input_buf = String::new();
-            let mut escape = false;
             // Keep reading events as long as they arrive within 100ms of each other
             loop {
                 if crossterm::event::poll(std::time::Duration::from_millis(100)).map_err(io_err)? {
                     match crossterm::event::read().map_err(io_err)? {
                         Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                             match k.code {
-                                KeyCode::Esc => {
-                                    escape = true;
-                                    break;
-                                }
                                 KeyCode::Char(c) => {
                                     input_buf.push(c);
                                 }
@@ -297,6 +295,22 @@ async fn run_loop(
                                 KeyCode::Tab => {
                                     input_buf.push('\t');
                                 }
+                                KeyCode::Esc => {
+                                    // Only cancel if we have NO buffered input yet.
+                                    // If we have input, this Esc is from bracketed paste
+                                    // mode wrapper (\x1b[200~...\x1b[201~) — ignore it.
+                                    if input_buf.is_empty() {
+                                        // User genuinely wants to cancel — break and go back
+                                        app.paste_json_buffer.clear();
+                                        app.paste_scroll = 0;
+                                        app.screen = Screen::AccountsMenu;
+                                        app.menu_idx = 2;
+                                        render(term, store, state, app)?;
+                                        input_buf.clear(); // ensure we don't set buffer below
+                                        break;
+                                    }
+                                    // Otherwise skip this Esc (bracketed paste artifact)
+                                }
                                 _ => {}
                             }
                         }
@@ -306,13 +320,23 @@ async fn run_loop(
                     break; // 100ms of silence — paste is done
                 }
             }
-            if escape {
-                app.paste_json_buffer.clear();
-                app.paste_scroll = 0;
-                app.screen = Screen::AccountsMenu;
-                app.menu_idx = 2;
-                render(term, store, state, app)?;
-                continue;
+            // Strip bracketed paste wrapper characters from the buffer.
+            // Terminals send \x1b[200~...\x1b[201~ around pasted text.
+            // The \x1b is captured as Esc (handled above), but [200~ and 201~
+            // remain as literal characters in the buffer.
+            if !input_buf.is_empty() {
+                // Remove [200~ prefix if present (bracketed paste start marker)
+                if let Some(stripped) = input_buf.strip_prefix("[200~") {
+                    input_buf = stripped.to_string();
+                }
+                // Remove 201~ suffix if present (bracketed paste end marker)
+                if let Some(stripped) = input_buf.strip_suffix("201~") {
+                    input_buf = stripped.to_string();
+                }
+                // Also strip any stray control characters (except \n, \t)
+                input_buf.retain(|c| !c.is_control() || c == '\n' || c == '\t');
+                // Trim leading/trailing whitespace
+                input_buf = input_buf.trim().to_string();
             }
             if !input_buf.is_empty() {
                 app.paste_json_buffer = input_buf;
