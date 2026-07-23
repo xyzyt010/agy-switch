@@ -52,19 +52,40 @@ impl FileStore {
             self.accounts = Vec::new();
             return Ok(());
         }
-        // Support both formats: {"accounts": [...]} (wrapped) and [...] (bare array)
+        // Support both formats:
+        // 1. Our internal format: [{"id":"...","email":"...","credential":{...},...}]
+        // 2. Official format: {"accounts":[{"email":"...","name":"...","id":"..."}]}
         let parsed: serde_json::Value = serde_json::from_str(&contents).map_err(AgySwitchError::Json)?;
         let accounts_arr = parsed
             .as_array()
             .cloned()
             .or_else(|| parsed.get("accounts").and_then(|v| v.as_array()).cloned())
             .ok_or_else(|| AgySwitchError::Json(serde_json::from_str::<serde_json::Value>("null").unwrap_err()))?;
-        let mut accounts = Vec::with_capacity(accounts_arr.len());
-        for v in accounts_arr {
-            accounts.push(serde_json::from_value(v).map_err(AgySwitchError::Json)?);
+
+        // Try to parse as our internal format first
+        let internal_result: Result<Vec<Account>, _> = accounts_arr.iter().map(|v| {
+            serde_json::from_value(v.clone())
+        }).collect();
+
+        if let Ok(accounts) = internal_result {
+            self.accounts = accounts;
+            return Ok(());
         }
-        self.accounts = accounts;
-        Ok(())
+
+        // Fall back to official format parsing
+        let official_entries: Result<Vec<crate::store::account::OfficialAccountEntry>, _> = accounts_arr.iter().map(|v| {
+            serde_json::from_value(v.clone())
+        }).collect();
+
+        match official_entries {
+            Ok(entries) => {
+                self.accounts = entries.iter()
+                    .filter_map(|e| Account::from_official(e))
+                    .collect();
+                Ok(())
+            }
+            Err(e) => Err(AgySwitchError::Json(e))
+        }
     }
 
     /// Flush accounts to disk atomically.

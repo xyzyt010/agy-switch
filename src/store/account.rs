@@ -15,15 +15,59 @@ pub struct OAuthCredential {
 pub struct Account {
     pub id: Uuid,
     pub email: String,
+    #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
     pub credential: OAuthCredential,
     pub quota: Option<crate::quota::models::QuotaSnapshot>,
+    #[serde(default)]
     pub added_at: DateTime<Utc>,
+    #[serde(default)]
     pub last_used_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub is_rate_limited: bool,
     pub rate_limit_reset_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub enabled: bool,
+}
+
+/// Official accounts.json entry format — different field names/types from Account.
+/// Used only for deserialization from the official `{"accounts":[...]}` file.
+#[derive(Deserialize)]
+pub struct OfficialAccountEntry {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    disabled: Option<bool>,
+}
+
+impl Account {
+    /// Create an Account from an official accounts.json entry (with only email/id/name).
+    pub fn from_official(entry: &OfficialAccountEntry) -> Option<Self> {
+        let email = entry.email.as_deref()?.to_string();
+        if email.is_empty() {
+            return None;
+        }
+        let id = entry.id.as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        Some(Account {
+            id,
+            email,
+            label: entry.name.clone(),
+            credential: OAuthCredential::default(),
+            quota: None,
+            added_at: Utc::now(),
+            last_used_at: None,
+            is_rate_limited: false,
+            rate_limit_reset_at: None,
+            enabled: !entry.disabled.unwrap_or(false),
+        })
+    }
 }
 
 impl Account {
