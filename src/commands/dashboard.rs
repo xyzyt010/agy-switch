@@ -338,6 +338,15 @@ async fn run_loop(
                 // Trim leading/trailing whitespace
                 input_buf = input_buf.trim().to_string();
             }
+            // Debug logging
+            if !input_buf.is_empty() {
+                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/agy-switch-debug.log") {
+                    use std::io::Write;
+                    let _ = writeln!(f, "=== PASTE BUFFER COLLECTED ===");
+                    let _ = writeln!(f, "Buffer length: {} bytes", input_buf.len());
+                    let _ = writeln!(f, "First 200 chars: {:?}", &input_buf.chars().take(200).collect::<String>());
+                }
+            }
             if !input_buf.is_empty() {
                 app.paste_json_buffer = input_buf;
                 app.paste_scroll = 0;
@@ -1878,9 +1887,29 @@ async fn handle_paste_confirm(
         }
         KeyCode::Enter if !app.paste_json_buffer.is_empty() => {
             let text = std::mem::take(&mut app.paste_json_buffer);
+            // Debug logging to diagnose import failures
+            let debug_log = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open("/tmp/agy-switch-debug.log");
+            if let Ok(mut f) = debug_log {
+                use std::io::Write;
+                let _ = writeln!(f, "=== PASTE IMPORT ===");
+                let _ = writeln!(f, "Text length: {} bytes", text.len());
+                let _ = writeln!(f, "First 200 chars: {:?}", &text.chars().take(200).collect::<String>());
+                let _ = writeln!(f, "Last 50 chars: {:?}", &text.chars().rev().take(50).collect::<String>());
+            }
             app.set_msg("Importing...", Color::Yellow);
             match execute_clipboard_import(store, &text).await {
                 Ok(r) => {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/agy-switch-debug.log") {
+                        use std::io::Write;
+                        let _ = writeln!(f, "Import result: imported={}, updated={}, skipped={}, errors={}", r.imported, r.updated, r.skipped, r.errors.len());
+                        for e in &r.errors {
+                            let _ = writeln!(f, "  Error: {}", e);
+                        }
+                        let _ = writeln!(f, "Store count after import: {}", store.count());
+                    }
                     if r.imported == 0 && r.updated == 0 && r.errors.is_empty() {
                         app.set_msg(
                             format!("All {} accounts skipped (duplicates or no email)", r.skipped),
@@ -1897,6 +1926,10 @@ async fn handle_paste_confirm(
                     }
                 }
                 Err(e) => {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open("/tmp/agy-switch-debug.log") {
+                        use std::io::Write;
+                        let _ = writeln!(f, "Import ERROR: {}", e);
+                    }
                     app.set_msg(format!("Import failed: {}", e), Color::Red);
                 }
             }

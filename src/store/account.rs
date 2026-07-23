@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OAuthCredential {
     pub access_token: String,
     pub refresh_token: String,
@@ -16,6 +16,7 @@ pub struct Account {
     pub id: Uuid,
     pub email: String,
     pub label: Option<String>,
+    #[serde(default)]
     pub credential: OAuthCredential,
     pub quota: Option<crate::quota::models::QuotaSnapshot>,
     pub added_at: DateTime<Utc>,

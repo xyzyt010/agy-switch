@@ -52,7 +52,17 @@ impl FileStore {
             self.accounts = Vec::new();
             return Ok(());
         }
-        let accounts: Vec<Account> = serde_json::from_str(&contents).map_err(AgySwitchError::Json)?;
+        // Support both formats: {"accounts": [...]} (wrapped) and [...] (bare array)
+        let parsed: serde_json::Value = serde_json::from_str(&contents).map_err(AgySwitchError::Json)?;
+        let accounts_arr = parsed
+            .as_array()
+            .cloned()
+            .or_else(|| parsed.get("accounts").and_then(|v| v.as_array()).cloned())
+            .ok_or_else(|| AgySwitchError::Json(serde_json::from_str::<serde_json::Value>("null").unwrap_err()))?;
+        let mut accounts = Vec::with_capacity(accounts_arr.len());
+        for v in accounts_arr {
+            accounts.push(serde_json::from_value(v).map_err(AgySwitchError::Json)?);
+        }
         self.accounts = accounts;
         Ok(())
     }
