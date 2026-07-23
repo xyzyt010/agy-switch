@@ -67,9 +67,14 @@ impl FileStore {
             serde_json::from_value(v.clone())
         }).collect();
 
+        // Only accept internal format if at least one account has real tokens
+        // (official format has no credential tokens — always fall back for those).
         if let Ok(accounts) = internal_result {
-            self.accounts = accounts;
-            return Ok(());
+            let has_real_tokens = accounts.iter().any(|a| !a.credential.refresh_token.is_empty());
+            if has_real_tokens {
+                self.accounts = accounts;
+                return Ok(());
+            }
         }
 
         // Fall back to official format parsing

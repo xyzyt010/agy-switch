@@ -18,4 +18,6 @@ pub enum Commands {
     Off,
     /// Stop daemon, then start daemon + TUI
     Restart,
+    /// Check that accounts.json loads correctly (for diagnostics)
+    Check,
 }

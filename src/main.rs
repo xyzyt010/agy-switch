@@ -35,6 +35,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             commands::on_off::turn_on().await?;
         }
+        Some(Commands::Check) => {
+            use crate::store::file_store::FileStore;
+            let path = crate::config::accounts_path();
+            println!("Accounts path: {}", path.display());
+            let mut store = FileStore::new(path);
+            match store.load().await {
+                Ok(()) => {
+                    println!("Load: OK");
+                    println!("Accounts loaded: {}", store.count());
+                    for (i, a) in store.list().iter().take(5).enumerate() {
+                        println!("  {}. {} / {:?}", i+1, a.email, a.label);
+                    }
+                    if store.count() > 5 {
+                        println!("  ... and {} more", store.count() - 5);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Load FAILED: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         None => {
             if commands::on_off::is_daemon_running().await {
                 commands::dashboard::run_dashboard().await?;
